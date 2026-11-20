@@ -30,3 +30,7 @@ The anonymous identifier is shared by tabs in the same browser profile, so they 
 ## Container preparation
 
 A Dockerfile is included for a Python-compatible host. It runs as a non-root user and expects a persistent, writable volume mounted at `/data`; SQLite data is not included in the image. Before public deployment, replace the prototype's impersonable browser identity, add rate limiting and access controls, provide HTTPS and backups, and review the one-time legacy-room passcode setup. A container alone does not make this app production-ready.
+
+## Hosted Postgres preparation
+
+The backend supports a PostgreSQL connection in `DATABASE_URL` or `POSTGRES_URL`, and continues to use SQLite locally when neither is set. On Vercel one of these variables must be configured; credentials should only be set in the hosting provider's secret settings. A new hosted database starts empty; local SQLite records are not transferred automatically. The existing prototype security limitations still apply, and this adapter has not yet been verified against a live PostgreSQL service.

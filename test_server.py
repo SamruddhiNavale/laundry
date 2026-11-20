@@ -5,6 +5,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
+from unittest.mock import Mock
 from fastapi.testclient import TestClient
 
 
@@ -169,5 +170,18 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(self.start(self.d).status_code, 409)
         self.assertEqual(self.start(self.b).status_code, 200)
         self.assertEqual(self.state(self.d)['queue_position'], 1)
+
+    def test_postgres_query_translation_and_lock(self):
+        db = self.server.PostgresConnection.__new__(self.server.PostgresConnection)
+        db.connection = Mock()
+        db.execute('BEGIN IMMEDIATE')
+        db.connection.execute.assert_called_with('SELECT pg_advisory_xact_lock(492031)')
+        db.execute('UPDATE machines SET end=? WHERE id=?', (123, 4))
+        db.connection.execute.assert_called_with('UPDATE machines SET "end"=%s WHERE id=%s', (123, 4))
+
+    def test_vercel_requires_external_database(self):
+        with patch.object(self.server, 'DATABASE_URL', None), patch.dict(os.environ, {'VERCEL': '1'}):
+            with self.assertRaisesRegex(RuntimeError, 'Postgres'):
+                self.server.connect()
 
 if __name__ == '__main__': unittest.main()
