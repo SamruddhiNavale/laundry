@@ -14,11 +14,6 @@ python3 -m venv .venv
 
 Open http://127.0.0.1:8001. API documentation is available at http://127.0.0.1:8001/docs. Data persists in `laundry.db`; set `LAUNDRY_DB` to use a different database file.
 
-## Prototype limitations
-
-This is intended for local development, not public deployment. Browser identities are not authenticated and can be impersonated; there are no accounts or building access controls. The server must be reachable by every resident to share data. Notifications require the page to stay open, and there is no email, SMS, push service, or physical machine integration. Queue reservations do not expire automatically. Machine availability depends on residents accurately starting and clearing their loads.
-
-When a cycle ends, its owner sees an in-app Yes/No pickup prompt. Answering Yes frees the machine; No schedules another prompt one hour later. An unanswered prompt is also eligible again after an hour. The schedule persists on the server, and a due prompt appears when the owner next opens the app. Browser notifications are supplementary and require permission and an open page; direct Yes/No buttons in operating-system notifications and delivery while the app is closed require a push service and service worker (or a native app).
 
 ## Rooms and invitations
 
