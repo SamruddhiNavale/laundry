@@ -1,0 +1,196 @@
+"""Local shared laundry prototype. Do not expose to the public internet."""
+import os
+import hashlib
+import hmac
+import secrets
+import sqlite3
+import time
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+ROOT = Path(__file__).resolve().parent
+DB = os.environ.get('LAUNDRY_DB', str(ROOT / 'laundry.db'))
+app = FastAPI(title='Loop Laundry API')
+
+
+def connect():
+    db = sqlite3.connect(DB, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute('PRAGMA foreign_keys=ON')
+    return db
+
+
+def initialize():
+    with connect() as db:
+        db.executescript('''CREATE TABLE IF NOT EXISTS machines (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'free', owner TEXT, end REAL);
+        CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id INTEGER NOT NULL REFERENCES machines(id), client TEXT NOT NULL, UNIQUE(machine_id,client));
+        CREATE TABLE IF NOT EXISTS rooms (code TEXT PRIMARY KEY, name TEXT NOT NULL);''')
+        db.execute("INSERT OR IGNORE INTO rooms(code,name) VALUES('MAPLE1','Maple House')")
+        if 'passcode_hash' not in [row['name'] for row in db.execute('PRAGMA table_info(rooms)')]:
+            db.execute('ALTER TABLE rooms ADD COLUMN passcode_hash TEXT')
+        if 'room' not in [row['name'] for row in db.execute('PRAGMA table_info(machines)')]:
+            db.execute("ALTER TABLE machines ADD COLUMN room TEXT NOT NULL DEFAULT 'MAPLE1'")
+        if 'next_reminder' not in [row['name'] for row in db.execute('PRAGMA table_info(machines)')]:
+            db.execute('ALTER TABLE machines ADD COLUMN next_reminder REAL')
+        if not db.execute('SELECT 1 FROM machines LIMIT 1').fetchone():
+            db.executemany('INSERT INTO machines(id,type,name) VALUES(?,?,?)', [(i, 'washer' if i <= 3 else 'dryer', ('Washer' if i <= 3 else 'Dryer') + f' {((i-1)%3)+1:02}') for i in range(1,7)])
+
+initialize()
+
+class Start(BaseModel):
+    minutes: int = Field(ge=1, le=240, strict=True)
+
+class RoomSetup(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    washers: int = Field(ge=0, le=50, strict=True)
+    dryers: int = Field(ge=0, le=50, strict=True)
+
+class CreateRoom(RoomSetup):
+    passcode: str = Field(min_length=6, max_length=128, pattern=r'^[\x21-\x7e]+$')
+
+class Passcode(BaseModel):
+    passcode: str = Field(min_length=6, max_length=128, pattern=r'^[\x21-\x7e]+$')
+
+def hash_passcode(passcode):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', passcode.encode(), bytes.fromhex(salt), 260000).hex()
+    return salt + ':' + digest
+
+def verify_passcode(passcode, stored):
+    if not passcode or not stored or len(passcode) > 128: return False
+    salt, expected = stored.split(':')
+    actual = hashlib.pbkdf2_hmac('sha256', passcode.encode(), bytes.fromhex(salt), 260000).hex()
+    return hmac.compare_digest(actual, expected)
+
+def get_room(db, code, passcode):
+    room = db.execute('SELECT * FROM rooms WHERE code=?', (code.upper(),)).fetchone()
+    if not room or not verify_passcode(passcode, room['passcode_hash']):
+        raise HTTPException(403, 'Invalid room code or passcode')
+    return room
+
+def resize(db, code, washers, dryers):
+    for kind, count in [('washer', washers), ('dryer', dryers)]:
+        rows = list(db.execute('SELECT * FROM machines WHERE room=? AND type=? ORDER BY id', (code, kind)))
+        if len(rows) > count:
+            remove = rows[count:]
+            if any(m['state'] != 'free' or db.execute('SELECT 1 FROM queue WHERE machine_id=?', (m['id'],)).fetchone() for m in remove):
+                raise HTTPException(409, 'Cannot remove machines that are in use or have a queue')
+            db.executemany('DELETE FROM machines WHERE id=?', [(m['id'],) for m in remove])
+        else:
+            for n in range(len(rows)+1, count+1):
+                db.execute('INSERT INTO machines(type,name,room) VALUES(?,?,?)', (kind, f'{kind.title()} {n:02}', code))
+
+@app.post('/api/rooms/{code}/set-initial-passcode')
+def set_initial_passcode(code: str, body: Passcode):
+    # Only pre-existing rooms without a passcode can use this one-time migration.
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT passcode_hash FROM rooms WHERE code=?', (code.upper(),)).fetchone()
+        if not row or row['passcode_hash'] is not None:
+            raise HTTPException(409, 'Room is unavailable or already has a passcode')
+        db.execute('UPDATE rooms SET passcode_hash=? WHERE code=?', (hash_passcode(body.passcode), code.upper()))
+    return {'ok': True}
+
+@app.post('/api/rooms')
+def create_room(body: CreateRoom):
+    name = body.name.strip()
+    if not name: raise HTTPException(422, 'Room name is required')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        code = secrets.token_hex(4).upper()
+        while db.execute('SELECT 1 FROM rooms WHERE code=?', (code,)).fetchone(): code = secrets.token_hex(4).upper()
+        db.execute('INSERT INTO rooms(code,name,passcode_hash) VALUES(?,?,?)', (code,name,hash_passcode(body.passcode)))
+        resize(db, code, body.washers, body.dryers)
+    return {'code': code, 'name': name}
+
+@app.put('/api/room')
+def edit_room(body: RoomSetup, x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None)):
+    name = body.name.strip()
+    if not name: raise HTTPException(422, 'Room name is required')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        room = get_room(db, x_room_code, x_room_passcode)
+        transition(db)
+        resize(db, room['code'], body.washers, body.dryers)
+        db.execute('UPDATE rooms SET name=? WHERE code=?', (name,room['code']))
+    return {'ok': True}
+
+
+def client_id(value: Optional[str]):
+    if not value or len(value) > 128 or not all(c.isalnum() or c == '-' for c in value):
+        raise HTTPException(400, 'Invalid client identifier')
+    return value
+
+
+def transition(db):
+    db.execute("UPDATE machines SET state='done', next_reminder=end WHERE state='busy' AND end <= ?", (time.time(),))
+
+
+@app.get('/api/state')
+def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None)):
+    client = client_id(x_client_id)
+    with connect() as db:
+        room = get_room(db, x_room_code, x_room_passcode)
+        transition(db)
+        machines = []
+        for row in db.execute('SELECT * FROM machines WHERE room=? ORDER BY id', (room['code'],)):
+            m = dict(row)
+            m['mine'] = m.pop('owner') == client
+            if not m['mine']:
+                m.pop('next_reminder')
+            queue = list(db.execute('SELECT client FROM queue WHERE machine_id=? ORDER BY id', (m['id'],)))
+            m['queue_length'] = len(queue)
+            m['queue_position'] = next((i for i, q in enumerate(queue, 1) if q['client'] == client), None)
+            machines.append(m)
+        return {'machines': machines, 'room': {'code': room['code'], 'name': room['name']}}
+
+
+@app.post('/api/machines/{machine_id}/{action}')
+def action(machine_id: int, action: str, payload: Optional[Start] = None, x_client_id: Optional[str] = Header(default=None), x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None)):
+    client = client_id(x_client_id)
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        room = get_room(db, x_room_code, x_room_passcode)
+        transition(db)
+        row = db.execute('SELECT * FROM machines WHERE id=? AND room=?', (machine_id,room['code'])).fetchone()
+        if not row: raise HTTPException(404, 'Machine not found')
+        if action == 'start':
+            if payload is None: raise HTTPException(422, 'Cycle length is required')
+            if row['state'] != 'free': raise HTTPException(409, 'Machine is not available')
+            first = db.execute('SELECT client FROM queue WHERE machine_id=? ORDER BY id LIMIT 1', (machine_id,)).fetchone()
+            if first and first['client'] != client: raise HTTPException(409, 'This machine is reserved for the first person in line')
+            db.execute("UPDATE machines SET state='busy',owner=?,end=?,next_reminder=NULL WHERE id=?", (client,time.time()+payload.minutes*60,machine_id))
+            db.execute('DELETE FROM queue WHERE machine_id=? AND client=?', (machine_id,client))
+        elif action == 'finish':
+            if row['state'] != 'busy' or row['owner'] != client: raise HTTPException(403, 'Only the person running this cycle can end it')
+            db.execute("UPDATE machines SET state='done',next_reminder=? WHERE id=?", (time.time(),machine_id))
+        elif action == 'clear':
+            if row['state'] != 'done' or row['owner'] != client: raise HTTPException(403, 'Only the person running this cycle can confirm pickup')
+            db.execute("UPDATE machines SET state='free',owner=NULL,end=NULL,next_reminder=NULL WHERE id=?", (machine_id,))
+        elif action == 'remind':
+            if row['state'] != 'done' or row['owner'] != client: raise HTTPException(403, 'Only the cycle owner can receive this reminder')
+            if row['next_reminder'] is not None and row['next_reminder'] > time.time(): raise HTTPException(409, 'Reminder is not due')
+            db.execute('UPDATE machines SET next_reminder=? WHERE id=?', (time.time()+3600,machine_id))
+        elif action == 'still-there':
+            if row['state'] != 'done' or row['owner'] != client: raise HTTPException(403, 'Only the cycle owner can respond')
+            db.execute('UPDATE machines SET next_reminder=? WHERE id=?', (time.time()+3600,machine_id))
+        elif action == 'queue':
+            existing = db.execute('SELECT id FROM queue WHERE machine_id=? AND client=?', (machine_id,client)).fetchone()
+            if existing: db.execute('DELETE FROM queue WHERE id=?', (existing['id'],))
+            elif row['state'] == 'free' and not db.execute('SELECT 1 FROM queue WHERE machine_id=?', (machine_id,)).fetchone(): raise HTTPException(409, 'This machine is available')
+            elif row['owner'] == client: raise HTTPException(409, 'You are using this machine')
+            else: db.execute('INSERT INTO queue(machine_id,client) VALUES(?,?)', (machine_id,client))
+        else: raise HTTPException(404, 'Unknown action')
+    return {'ok': True}
+
+@app.get('/')
+def index(): return FileResponse(ROOT / 'index.html')
+
+@app.get('/{asset}')
+def asset(asset: str):
+    if asset not in ('app.js', 'style.css', 'manifest.webmanifest', 'sw.js', 'icon-192.png', 'icon-512.png'):
+        raise HTTPException(404, 'Not found')
+    return FileResponse(ROOT / asset)
