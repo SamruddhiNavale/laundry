@@ -1,3 +1,4 @@
+import base64
 import importlib
 import os
 import tempfile
@@ -6,6 +7,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from unittest.mock import Mock
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 
@@ -157,6 +160,62 @@ class LaundryTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: self.post('remind').status_code, range(2)))
         self.assertEqual(sorted(results), [200, 409])
+
+    def test_remembered_room_access_is_scoped_to_the_joined_room(self):
+        joined = self.c.post('/api/room/membership', headers={**self.a, 'X-Room-Code': 'MAPLE1'})
+        self.assertEqual(joined.status_code, 200)
+        remembered = {'X-Client-Id': 'alice', 'X-Room-Token': joined.json()['token']}
+        self.assertEqual(self.c.get('/api/state', headers=remembered).status_code, 200)
+        self.assertEqual(self.start(remembered).status_code, 200)
+        other = self.c.post('/api/rooms', json={
+            'name': 'Other house', 'washers': 1, 'dryers': 0, 'passcode': 'different123',
+        }).json()['code']
+        self.assertEqual(self.c.get('/api/state', headers={
+            **remembered, 'X-Room-Code': other,
+        }).status_code, 403)
+
+    def test_force_stop_releases_only_the_completed_cycle_and_preserves_fifo(self):
+        self.start()
+        self.post('queue', self.b)
+        self.post('queue', self.d)
+        release = {**self.d, 'X-Cycle-End': str(self.state()['end'])}
+        self.assertEqual(self.post('force-stop', release).status_code, 409)
+        self.post('finish')
+        self.assertEqual(self.post('force-stop', {**release, 'X-Cycle-End': '1'}).status_code, 409)
+        self.assertEqual(self.post('force-stop', release).status_code, 200)
+        self.assertEqual(self.state(self.b)['queue_position'], 1)
+        self.assertEqual(self.start(self.d).status_code, 409)
+        self.assertEqual(self.start(self.b).status_code, 200)
+        self.assertEqual(self.post('force-stop', release).status_code, 409)
+
+    def test_background_push_sends_encrypted_reminder_and_stops_after_opt_out(self):
+        joined = self.c.post('/api/room/membership', headers={**self.a, 'X-Room-Code': 'MAPLE1'})
+        headers = {'X-Client-Id': 'alice', 'X-Room-Code': 'MAPLE1', 'X-Room-Token': joined.json()['token']}
+        key = self.c.get('/api/push/key').json()['key']
+        self.assertEqual(self.c.get('/api/push/key').json()['key'], key)
+        device_key = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint,
+        )
+        subscription = {'endpoint': 'https://fcm.googleapis.com/fcm/send/test', 'keys': {
+            'auth': base64.urlsafe_b64encode(b'a' * 16).decode().rstrip('='),
+            'p256dh': base64.urlsafe_b64encode(device_key).decode().rstrip('='),
+        }}
+        self.assertEqual(self.c.put('/api/push/device', headers=headers, json=subscription).status_code, 200)
+        with patch.object(self.server.time, 'time', return_value=10000):
+            self.start(minutes=1)
+        with patch.object(self.server.Session, 'post', return_value=Mock(status_code=201)) as send:
+            with patch.object(self.server.time, 'time', return_value=10060):
+                self.server.send_due_reminders()
+                self.server.send_due_reminders()
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0], subscription['endpoint'])
+                request = send.call_args.kwargs
+                self.assertIn('k=' + key, request['headers']['authorization'])
+                self.assertEqual(request['headers']['content-encoding'], 'aes128gcm')
+            self.assertEqual(self.c.delete('/api/push/device', headers=headers).status_code, 200)
+            with patch.object(self.server.time, 'time', return_value=13660):
+                self.server.send_due_reminders()
+            send.assert_called_once()
 
     def test_join_behind_reservation_and_only_owner_can_finish(self):
         self.assertEqual(self.start().status_code, 200)

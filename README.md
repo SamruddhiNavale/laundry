@@ -1,6 +1,6 @@
 # Loop Laundry
 
-A local shared laundry prototype with a FastAPI backend, SQLite database, and a plain HTML/CSS/JavaScript frontend. Machine status, cycle times, and FIFO queues are shared between browsers connected to the same server. Each browser receives a locally stored demo identity. Cycles become complete when the server next receives a request; the owner can confirm pickup. Open pages poll for updates and can show browser notifications.
+A local shared laundry prototype with a FastAPI backend, SQLite database, and a plain HTML/CSS/JavaScript frontend. Machine status, cycle times, and FIFO queues are shared between browsers connected to the same server. Each browser receives a locally stored demo identity. The server tracks cycle completion and sends pickup reminders through Web Push. Tap a reminder to open the pickup prompt.
 
 ## Run
 
@@ -17,15 +17,21 @@ Open http://127.0.0.1:8001. API documentation is available at http://127.0.0.1:8
 
 ## Rooms and invitations
 
-Use Create room to set a name and washer/dryer counts. Edit room changes those counts; machines with active loads or queues cannot be removed. Invite residents displays the room code and link, and Join room accepts a code. Rooms have separate machines and queues. The local server binds to 127.0.0.1, so its invite links only work on this computer; sharing with other devices requires a reachable hosted server. Codes are shared secrets, not secure authentication: anyone with a code can access and edit the room. Do not use this prototype for real residents without accounts, access controls, and secure hosting.
+Use Create room to set a name and washer/dryer counts. Edit room changes those counts; machines with active loads or queues cannot be removed. Invite residents displays the room code and link, and Join room accepts a code. Rooms have separate machines and queues. The local server binds to 127.0.0.1, so its invite links only work on this computer; sharing with other devices requires a reachable hosted server. Do not use this prototype for real residents without accounts, access controls, and secure hosting.
 
 Run the backend checks with `.venv/bin/python -m unittest -v test_server`.
 
-Rooms created now require a separate passcode (6–128 printable ASCII characters, no spaces). Share the invite code or link and communicate the passcode separately. The passcode is held in session storage for the current browser tab and sent with room requests; the server stores a salted password hash. Previously created rooms have no passcode: on this local prototype, select **Set up existing room** and set one once using the room code. This migration is first-come, so do it only on a trusted local server before sharing access. Anyone with a room passcode can edit the room; individual accounts, rate limiting, TLS, and administrator roles are still needed before public deployment.
+Rooms created now require a separate passcode (6–128 printable ASCII characters, no spaces). Share the invite code or link and communicate the passcode separately. After a successful join, the browser saves a room access token. The server stores hashes of passcodes and tokens. Previously joined devices may need to enter the passcode once after upgrading if their old browser session has already ended. Previously created rooms have no passcode: on this local prototype, select **Set up existing room** and set one once using the room code. This migration is first-come, so do it only on a trusted local server before sharing access. Anyone with a room passcode can edit the room; individual accounts, rate limiting, TLS, and administrator roles are still needed before public deployment.
 
 The app does not ask for a name or create a profile. It uses a random identifier stored in the browser to recognize that browser's loads and queue positions. Clearing browser storage or switching browsers loses that association; the identifier is pseudonymous rather than a guarantee of anonymity.
 
-The anonymous identifier is shared by tabs in the same browser profile, so they act as the same resident. Separate residents should use separate browser profiles or devices. Only the browser that started a load can end it and confirm pickup. Others can join its FIFO queue; when pickup is confirmed, the first person is offered the machine and receives an in-app alert and, if allowed, a browser notification while the page is open. A reserved machine also accepts additional people into the queue. Reservations currently do not expire, and browser storage loss can leave a load without its owner.
+The anonymous identifier is shared by tabs in the same browser profile, so they act as the same resident. Separate residents should use separate browser profiles or devices. The browser that started a load can end it and confirm pickup. A room member can use **Force stop** to release someone else’s completed cycle after checking that the drum is empty. The first person in the FIFO queue keeps their spot and receives an alert while the page is open. A reserved machine also accepts additional people into the queue. Reservations currently do not expire.
+
+## Mobile pickup notifications
+
+Serve Loop over HTTPS for mobile Web Push. On iPhone and iPad, open Loop using the installed Home Screen icon (iOS/iPadOS 16.4 or later). Notifications are on by default in Loop. Tap **Allow device notifications** once to grant your device’s permission. Use the top **Notifications** toggle to turn reminders off or back on. When a completed load is still waiting for pickup, reminders repeat hourly.
+
+The normal FastAPI server runs the reminder worker automatically. On Vercel, run `python server.py` as a persistent worker on a separate host with the same Postgres connection as the web app. The worker checks for due reminders every 15 seconds. Push keys are generated and persisted in the shared database. Set `LAUNDRY_PUSH_CONTACT` to your HTTPS site URL or a `mailto:` contact address.
 
 ## Container preparation
 

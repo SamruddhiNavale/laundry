@@ -5,3 +5,28 @@
 /* Cool blue palette */
 :root{--ink:#23364a;--muted:#788c9c;--green:#365e7c;--line:#e3ebf1;--cream:#f4f8fb}body{background:#f9fbfd}aside,.entry-card,.machine,.queue-panel{background:#fff}.brand>span:last-child,.entry-brand span{color:#9cc3dc}.brand-icon{background:#365e7c;color:#dcecf6}.building,.side-bottom{background:#f1f6fa}.building-icon{background:#dfeefa}.side-bottom,.entry-brand{color:#496d86}.side-bottom p,.side-bottom span{color:#829bac}nav a.active{background:#e7f1f8;color:#365e7c}.help-icon,.eyebrow span,.section-head h2 span,.panel-title h2 span{color:#8ebbd5}h1 em{color:#80abc7}.date-card,.reminder-panel{background:#edf5fa;border-color:#e1edf5}.date-card>span,.reminder-art{color:#9cc3db}.summary-icon.mint{background:#e5f2f8;color:#82adc5}.summary-icon.lavender{background:#eaeefa;color:#8f9fc6}.summary-icon.peach{background:#edf4f8;color:#8eaec2}.summary-note>span{color:#9ac2d8}.summary-note em{color:#7ba9c3}.filters{background:#eef4f8}.filters button.selected{color:#365e7c}.machine-illustration{background:#eff6fa;border-color:#e1eef5}.machine-illustration:after{border-color:#bfd9e8;background:#deedf5;box-shadow:inset 0 0 0 3px #f7fbfd}.dryer .machine-illustration{background:#f0f3fa}.dryer .machine-illustration:after{border-color:#c7d4e9;background:#e4ebf7}.status{background:#e7f4f6;color:#598c9d}.card-bottom button,.reminder-panel button,#toast{background:#365e7c;color:white}.card-bottom button.secondary,.reminder-panel button{background:#e9f2f8;color:#507790}.pill{background:#edf5f9;color:#7299ae}.entry-screen{background:#eef5fa}.entry-card{border-color:#dfebf3}.entry-actions button{background:#f7fbfd;border-color:#dceaf3;color:#365e7c}.entry-actions button:hover{background:#edf6fb;border-color:#8ebbd5}.room-controls button,dialog button{background:#e9f2f8;color:#365e7c}dialog{border-color:#dceaf3}dialog input{border-color:#dceaf3}
 .install-button{margin-top:22px;padding:0;border:0;background:none;color:#365e7c;font-weight:700;text-decoration:underline;font-size:12px}
+
+.notification-toggle {
+  border: 1px solid #b9cddb;
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: #fff;
+  color: #365e7c;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.notification-toggle[aria-pressed="true"] { background: #365e7c; color: white; }
+.machine-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.card-bottom button.force-stop { background: #fbefeb; color: #903d29; }
+#enable-alerts { margin-bottom: 12px; }
+@media (max-width: 480px) {
+  .header-right .live { display: none; }
+}
+
+.header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.mobile-home { display: none; }
+@media (max-width: 600px) {
+  .mobile-home { display: inline-grid; place-items: center; width: 44px; height: 44px; flex-shrink: 0; }
+  .mobile-home .brand-icon { margin: 0; }
+}

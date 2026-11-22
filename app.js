@@ -1,32 +1,283 @@
-const roomParam=new URLSearchParams(location.search).get('room');let roomCode=(roomParam||'').toUpperCase();let roomPasscode=sessionStorage.getItem('loop-pass-'+roomCode)||'';const nativeFetch=window.fetch.bind(window);window.fetch=(url,options={})=>nativeFetch(url,{...options,headers:{...options.headers,'X-Room-Code':roomCode,'X-Room-Passcode':roomPasscode}});
+const params = new URLSearchParams(location.search);
+const roomParam = params.get('room')?.trim().toUpperCase();
+const pickupFromPush = params.get('pickup');
+const pickupCycleEnd = Number(params.get('end'));
+const nativeFetch = window.fetch.bind(window);
+let roomCode = '';
+let roomToken = '';
+let roomVersion = 0;
+
+function roomRequest(url, options = {}) {
+  return nativeFetch(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      'X-Client-Id': client,
+      'X-Room-Code': roomCode,
+      'X-Room-Token': roomToken,
+    },
+  });
+}
+
 const clientKey='loop-client-id';let client=localStorage.getItem(clientKey);if(!client){client=crypto.randomUUID();localStorage.setItem(clientKey,client)}
-let machines=[],filter='all',previous=new Map(),initialized=false;const $=s=>document.querySelector(s);
+let machines=[],filter='all',pushRegistered=false;const $=s=>document.querySelector(s);
 function toast(message){const t=$('#toast');t.textContent=message;t.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.classList.remove('show'),4000)}
-function notify(title,body){try{if('Notification'in window&&Notification.permission==='granted')new Notification(title,{body})}catch(e){console.warn('Browser notification unavailable',e)}toast(body)}
-async function refresh(){try{const res=await fetch('/api/state',{headers:{'X-Client-Id':client},cache:'no-store'});if(res.status===403){roomPasscode='';showEntry('Please enter the room code and passcode again.');return}if(!res.ok)throw Error('Unable to load machine status');const data=await res.json();machines=data.machines;updateRoom(data.room);for(const m of machines){const alertKey=`loop-turn-${roomCode}-${m.id}`;const isTurn=m.state==='free'&&m.queue_position===1;if(isTurn&&!localStorage.getItem(alertKey)){localStorage.setItem(alertKey,'shown');notify(`${m.name} is available`,"It’s your turn. Start your load when you’re ready.")}else if(!isTurn)localStorage.removeItem(alertKey);previous.set(m.id,{state:m.state,queue_position:m.queue_position})}initialized=true;render();checkReminders()}catch(e){toast(e.message)}}
+async function refresh() {
+  const version = roomVersion;
+  try {
+    const res = await roomRequest('/api/state', {cache: 'no-store'});
+    if (version !== roomVersion) return false;
+    if (res.status === 403) {
+      localStorage.removeItem('loop-token-' + roomCode);
+      roomToken = '';
+      showEntry('Please enter the room code and passcode again.');
+      return false;
+    }
+    if (!res.ok) throw Error('Unable to load machine status');
+    const data = await res.json();
+    if (version !== roomVersion) return false;
+    machines = data.machines;
+    pushRegistered = data.push_registered;
+    updateRoom(data.room);
+    for (const m of machines) {
+      const key = `loop-turn-${roomCode}-${m.id}`;
+      if (m.state === 'free' && m.queue_position === 1) {
+        if (!localStorage.getItem(key)) {
+          localStorage.setItem(key, 'shown');
+          const body = 'It’s your turn. Start your load when you’re ready.';
+          toast(body);
+          if (alertsEnabled() && window.Notification?.permission === 'granted') {
+            registration.then(worker => worker?.showNotification(`${m.name} is available`, {
+              body, icon: '/icon-192.png', data: {room: data.room.code},
+            })).catch(console.warn);
+          }
+        }
+      } else {
+        localStorage.removeItem(key);
+      }
+    }
+    render();
+    checkReminders();
+    return true;
+  } catch (error) {
+    if (version === roomVersion) toast(error.message);
+    return false;
+  }
+}
 function render(){for(const type of ['washer','dryer'])$(`#${type==='washer'?'wash':'dry'}-count`).innerHTML=`${machines.filter(m=>m.type===type&&m.state==='free'&&!m.queue_length).length} <span>/ ${machines.filter(m=>m.type===type).length}</span>`;const queued=machines.filter(m=>m.queue_position);$('#queue-count').textContent=queued.length;$('#queue-badge').textContent=`${queued.length} waiting`;
-$('#machine-grid').innerHTML=machines.filter(m=>filter==='all'||m.type===filter).map(m=>{const minutes=Math.max(1,Math.ceil((m.end*1000-Date.now())/60000));const reserved=m.state==='free'&&m.queue_length;const detail=m.state==='free'?(reserved?'Reserved for the next person':'Ready for your next load'):m.state==='done'?`Cycle finished · ${m.mine?'your clothes':'clothes may remain'}`:`${m.mine?'Your cycle':'In use'} · <strong>~${minutes} min left</strong>`;let button=m.state==='free'&&(!reserved||m.queue_position===1)?`<button data-action="start" data-id="${m.id}">Start a load ↗</button>`:m.mine&&m.state==='done'?`<button data-action="clear" data-id="${m.id}">Clothes picked up ✓</button>`:m.mine?`<button class="secondary" data-action="finish" data-id="${m.id}">End cycle</button>`:m.state==='free'&&m.queue_position?`<span>In queue · position ${m.queue_position}</span>`:`<button class="secondary" data-action="queue" data-id="${m.id}">${m.queue_position?'Leave queue':'Join queue'} ${m.queue_position?'−':'+'}</button>`;return `<article class="machine ${m.type}"><div class="card-top"><span class="machine-type">${m.type.toUpperCase()}</span><span class="status ${m.state==='busy'?'busy':m.state==='done'?'done':''}">● ${m.state==='free'?(reserved?'Reserved':'Available'):m.state==='done'?'Cycle complete':'In use'}</span></div><div class="machine-body"><div class="machine-illustration"></div><div><h3>${m.name}</h3><div class="machine-detail">${detail}</div></div></div><div class="card-bottom"><span>${m.queue_length?`${m.queue_length} in queue`:m.state==='free'?'Ready to go':m.state==='done'?'Waiting for pickup':'Running now'}</span>${button}</div></article>`}).join('');
+$('#machine-grid').innerHTML=machines.filter(m=>filter==='all'||m.type===filter).map(m=>{const minutes=Math.max(1,Math.ceil((m.end*1000-Date.now())/60000));const reserved=m.state==='free'&&m.queue_length;const detail=m.state==='free'?(reserved?'Reserved for the next person':'Ready for your next load'):m.state==='done'?`Cycle finished · ${m.mine?'your clothes':'clothes may remain'}`:`${m.mine?'Your cycle':'In use'} · <strong>~${minutes} min left</strong>`;let button=m.state==='free'&&(!reserved||m.queue_position===1)?`<button data-action="start" data-id="${m.id}">Start a load ↗</button>`:m.mine&&m.state==='done'?`<button data-action="clear" data-id="${m.id}">Clothes picked up ✓</button>`:m.mine?`<button class="secondary" data-action="finish" data-id="${m.id}">End cycle</button>`:m.state==='free'&&m.queue_position?`<span>In queue · position ${m.queue_position}</span>`:`<button class="secondary" data-action="queue" data-id="${m.id}">${m.queue_position?'Leave queue':'Join queue'} ${m.queue_position?'−':'+'}</button>`;return `<article class="machine ${m.type}"><div class="card-top"><span class="machine-type">${m.type.toUpperCase()}</span><span class="status ${m.state==='busy'?'busy':m.state==='done'?'done':''}">● ${m.state==='free'?(reserved?'Reserved':'Available'):m.state==='done'?'Cycle complete':'In use'}</span></div><div class="machine-body"><div class="machine-illustration"></div><div><h3>${m.name}</h3><div class="machine-detail">${detail}</div></div></div><div class="card-bottom"><span>${m.queue_length?`${m.queue_length} in queue`:m.state==='free'?'Ready to go':m.state==='done'?'Waiting for pickup':'Running now'}</span><div class="machine-actions">${button}${m.state==='done'&&!m.mine?`<button class="force-stop" data-action="force-stop" data-id="${m.id}">Force stop</button>`:''}</div></div></article>`}).join('');
 $('#queue-list').innerHTML=queued.length?queued.map(m=>`<div class="queue-row"><div><strong>${m.name}</strong><small>${m.state==='free'&&m.queue_position===1?'Available now · your turn':`Position ${m.queue_position} in line`}</small></div><button data-action="queue" data-id="${m.id}">Leave queue</button></div>`).join(''):'<div class="empty">No waiting around here. Join a queue on a busy machine and your spot will show up here.</div>'}
-document.addEventListener('click',async e=>{const f=e.target.closest('[data-filter]');if(f){filter=f.dataset.filter;document.querySelectorAll('[data-filter]').forEach(b=>b.classList.toggle('selected',b===f));render();return}const b=e.target.closest('[data-action]');if(!b)return;const m=machines.find(x=>x.id===Number(b.dataset.id));let body;if(b.dataset.action==='start'){const raw=await cyclePrompt(`How many minutes will ${m.name} run?`,m.type==='washer'?'35':'45');if(raw===null)return;const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240){toast('Enter a whole number between 1 and 240 minutes.');return}body=JSON.stringify({minutes})}b.disabled=true;try{const res=await fetch(`/api/machines/${m.id}/${b.dataset.action}`,{method:'POST',headers:{'X-Client-Id':client,'Content-Type':'application/json'},body});const result=await res.json();if(!res.ok)throw Error(result.detail||'Request failed');if(b.dataset.action!=='finish')toast(b.dataset.action==='clear'?`${m.name} is now available.`:'Your update was saved.');await refresh()}catch(e){toast(e.message);await refresh()}});
-async function enable(){if(!('Notification'in window)){toast('This browser does not support notifications.');return}try{const result=await Notification.requestPermission();$('#notification-status').textContent=result==='granted'?'Notifications enabled while this page is open.':result==='denied'?'Notifications are blocked in your browser settings.':'Notifications were not enabled.'}catch{toast('Notifications need a secure context such as localhost.')}}$('#enable-alerts').onclick=enable;$('#notifications').onclick=enable;if('Notification'in window&&Notification.permission==='granted')$('#notification-status').textContent='Notifications enabled while this page is open.';setInterval(()=>{if(roomCode&&roomPasscode)refresh()},5000);
+document.addEventListener('click',async e=>{const f=e.target.closest('[data-filter]');if(f){filter=f.dataset.filter;document.querySelectorAll('[data-filter]').forEach(b=>b.classList.toggle('selected',b===f));render();return}const b=e.target.closest('[data-action]');if(!b)return;const m=machines.find(x=>x.id===Number(b.dataset.id));if(!m)return;const version=roomVersion;
+if(b.dataset.action==='force-stop'&&!window.confirm(`Release ${m.name}? Check that the cycle is finished and the drum is empty first. The queue will be kept.`))return;
+let body;if(b.dataset.action==='start'){const raw=await cyclePrompt(`How many minutes will ${m.name} run?`,m.type==='washer'?'35':'45');if(raw===null)return;const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240){toast('Enter a whole number between 1 and 240 minutes.');return}body=JSON.stringify({minutes})}if(version!==roomVersion)return;b.disabled=true;try{const res=await roomRequest(`/api/machines/${m.id}/${b.dataset.action}`,{method:'POST',headers:{'X-Client-Id':client,'Content-Type':'application/json',...(b.dataset.action==='force-stop'?{'X-Cycle-End':String(m.end)}:{})},body});const result=await res.json();if(!res.ok)throw Error(result.detail||'Request failed');if(b.dataset.action!=='finish')toast(['clear','force-stop'].includes(b.dataset.action)?`${m.name} was released.`:'Your update was saved.');await refresh()}catch(e){toast(e.message);await refresh()}});
+const alertsButton = $('#notifications');
+const registration = 'serviceWorker' in navigator
+  ? navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).catch(() => null)
+  : Promise.resolve(null);
+const supportsPush = 'PushManager' in window && 'Notification' in window && 'serviceWorker' in navigator;
+const alertsEnabled = () => localStorage.getItem('loop-alerts') !== 'off';
+
+function updateAlerts(status) {
+  const enabled = alertsEnabled();
+  alertsButton.setAttribute('aria-pressed', String(enabled));
+  alertsButton.textContent = `Notifications ${enabled ? 'on' : 'off'}`;
+  $('#enable-alerts').hidden = !enabled || (pushRegistered && !status) || !supportsPush || Notification.permission === 'denied';
+  $('#notification-status').textContent = status || (!enabled ? 'Notifications are off on this device.'
+    : !supportsPush ? 'To get mobile alerts, open Loop from your home screen on a browser that supports Web Push.'
+    : Notification.permission === 'denied' ? 'Allow notifications in your device settings to receive alerts.'
+    : pushRegistered ? 'Pickup reminders can arrive while Loop is closed.'
+    : 'Tap Allow notifications to receive reminders while Loop is closed.');
+}
+
+let alertSync = Promise.resolve();
+function syncAlerts() {
+  alertSync = alertSync.catch(() => {}).then(async () => {
+    if (!roomToken || !supportsPush) return;
+    const worker = await registration;
+    if (!worker || !roomToken) return;
+    let subscription = await worker.pushManager.getSubscription();
+    if (!alertsEnabled() || Notification.permission !== 'granted') {
+      if (subscription) await subscription.unsubscribe();
+      const response = await roomRequest('/api/push/device', {method: 'DELETE'});
+      if (!response.ok) throw Error('Couldn’t update notification settings.');
+      pushRegistered = false;
+      return;
+    }
+    if (!subscription) {
+      const response = await nativeFetch('/api/push/key');
+      if (!response.ok) throw Error('Couldn’t set up notifications.');
+      const {key} = await response.json();
+      const padded = key.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(key.length / 4) * 4, '=');
+      subscription = await worker.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: Uint8Array.from(atob(padded), c => c.charCodeAt(0)),
+      });
+    }
+    const response = await roomRequest('/api/push/device', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(subscription),
+    });
+    if (!response.ok) throw Error('Couldn’t register this device for notifications.');
+    pushRegistered = true;
+  });
+  return alertSync.then(() => updateAlerts()).catch(error => updateAlerts(error.message));
+}
+
+async function changeAlerts(enabled) {
+  alertsButton.disabled = $('#enable-alerts').disabled = true;
+  localStorage.setItem('loop-alerts', enabled ? 'on' : 'off');
+  try {
+    if (enabled && supportsPush && Notification.permission === 'default') {
+      await Notification.requestPermission();
+    }
+    await syncAlerts();
+  } catch {
+    updateAlerts('Couldn’t enable device notifications.');
+  } finally {
+    alertsButton.disabled = $('#enable-alerts').disabled = false;
+  }
+}
+alertsButton.onclick = () => changeAlerts(!alertsEnabled());
+$('#enable-alerts').onclick = () => changeAlerts(true);
+window.addEventListener('storage', event => {
+  if (event.key === 'loop-alerts') syncAlerts();
+});
+setInterval(() => { if (roomToken) refresh(); }, 5000);
 function cyclePrompt(label, initial){return new Promise(resolve=>{const d=document.createElement('dialog');d.innerHTML='<form><label></label><input type="number" min="1" max="240" step="1" required><button type="button">Cancel</button> <button type="submit">Start load</button></form>';const form=d.querySelector('form');form.querySelector('label').textContent=label;form.querySelector('input').value=initial;document.body.append(d);let done=false;function finish(value){if(done)return;done=true;d.close();d.remove();resolve(value)}form.querySelector('button[type=button]').onclick=()=>finish(null);d.addEventListener('cancel',e=>{e.preventDefault();finish(null)});form.onsubmit=e=>{e.preventDefault();finish(form.querySelector('input').value)};d.showModal()})}
-let reminderOpen=false;
-async function checkReminders(){if(reminderOpen)return;const m=machines.find(x=>x.mine&&x.state==='done'&&(!x.next_reminder||x.next_reminder*1000<=Date.now()));if(!m)return;reminderOpen=true;try{const claimed=await fetch(`/api/machines/${m.id}/remind`,{method:'POST',headers:{'X-Client-Id':client}});if(!claimed.ok)return;notify('Laundry pickup reminder',`${m.name} has finished. Have you removed your clothes?`);const answer=await pickupPrompt(m.name);const action=answer==='yes'?'clear':'still-there';const res=await fetch(`/api/machines/${m.id}/${action}`,{method:'POST',headers:{'X-Client-Id':client}});if(!res.ok)throw Error('Could not save your response. Please try again.');toast(answer==='yes'?`${m.name} is now available.`:'We’ll remind you again in an hour.');await refresh()}catch(e){toast(e.message)}finally{reminderOpen=false}}
+let reminderOpen = false;
+let pushPickupPending = Boolean(pickupFromPush);
+async function checkReminders() {
+  if (reminderOpen || !alertsEnabled() || document.visibilityState !== 'visible') return;
+  const fromPush = pushPickupPending && roomCode === roomParam;
+  const m = fromPush
+    ? machines.find(x => x.id === Number(pickupFromPush) && x.end === pickupCycleEnd && x.mine && x.state === 'done')
+    : !pushRegistered && machines.find(x => x.mine && x.state === 'done' && (!x.next_reminder || x.next_reminder * 1000 <= Date.now()));
+  if (fromPush) pushPickupPending = false;
+  if (!m) return;
+  reminderOpen = true;
+  const version = roomVersion;
+  try {
+    if (!fromPush) {
+      const claim = await roomRequest(`/api/machines/${m.id}/remind`, {method: 'POST'});
+      if (!claim.ok || version !== roomVersion) return;
+    }
+    const answer = await pickupPrompt(m.name);
+    if (version !== roomVersion) return;
+    const action = answer === 'yes' ? 'clear' : 'still-there';
+    const res = await roomRequest(`/api/machines/${m.id}/${action}`, {
+      method: 'POST', headers: {'X-Cycle-End': String(m.end)},
+    });
+    if (!res.ok) throw Error('This pickup response could not be saved.');
+    toast(answer === 'yes' ? `${m.name} was released.` : 'We’ll remind you again in an hour.');
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    reminderOpen = false;
+  }
+}
 function pickupPrompt(name){return new Promise(resolve=>{const d=document.createElement('dialog');d.innerHTML='<form><h2>Laundry is ready</h2><p style="margin:14px 0;line-height:1.5"></p><button type="button" data-answer="no">No, still there</button> <button type="button" data-answer="yes">Yes, removed</button></form>';d.querySelector('p').textContent=`Have you removed your clothes from ${name}? If not, we’ll ask again in one hour.`;document.body.append(d);let done=false;function finish(answer){if(done)return;done=true;d.close();d.remove();resolve(answer)}d.querySelectorAll('[data-answer]').forEach(b=>b.onclick=()=>finish(b.dataset.answer));d.addEventListener('cancel',e=>{e.preventDefault();finish('no')});d.showModal()})}
 function updateRoom(room){document.querySelectorAll('.building strong,.date-card strong').forEach(e=>e.textContent=room.name);const crumb=document.querySelector('.breadcrumb');crumb.textContent=room.name+' / Laundry room'}
 const roomControls=document.createElement('div');roomControls.className='room-controls';roomControls.innerHTML='<button id="edit-room">Edit room</button><button id="invite-room">Invite residents</button><button id="join-room">Join room</button><button id="create-room">Create room</button>';document.querySelector('.section-head').append(roomControls);
 function formDialog(title, fields){return new Promise(resolve=>{const d=document.createElement('dialog');const form=document.createElement('form');const heading=document.createElement('h2');heading.textContent=title;form.append(heading);for(const field of fields){const label=document.createElement('label');label.textContent=field.label;const input=document.createElement('input');input.name=field.name;input.type=field.type||'text';input.value=field.value??'';input.required=true;if(input.type==='number'){input.min='0';input.max='50';input.step='1'}label.append(input);form.append(label)}const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel';const submit=document.createElement('button');submit.textContent='Continue';submit.type='submit';form.append(cancel,submit);d.append(form);document.body.append(d);let finished=false;function finish(data){if(finished)return;finished=true;d.close();d.remove();resolve(data)}cancel.onclick=()=>finish(null);d.addEventListener('cancel',e=>{e.preventDefault();finish(null)});form.addEventListener('submit',e=>{e.preventDefault();finish(Object.fromEntries(new FormData(form)))});d.showModal()})}
-function changeRoom(code, passcode){roomCode=code.toUpperCase();roomPasscode=passcode;sessionStorage.setItem('loop-pass-'+roomCode,passcode);localStorage.setItem('loop-room',roomCode);history.replaceState(null,'',location.pathname);previous.clear();initialized=false;document.getElementById('entry-screen').hidden=true;document.querySelector('main').hidden=false;document.querySelector('aside').hidden=false;refresh()}
-async function setupRoom(create){const name=document.querySelector('.date-card strong').textContent;const result=await formDialog(create?'Create a laundry room':'Edit laundry room',[{name:'name',label:'Room name',value:create?'':name},{name:'washers',label:'Number of washers',type:'number',value:create?3:machines.filter(m=>m.type==='washer').length},{name:'dryers',label:'Number of dryers',type:'number',value:create?3:machines.filter(m=>m.type==='dryer').length},...(create?[{name:'passcode',label:'Room passcode (6–128 characters, no spaces)',type:'password'}]:[])]);if(!result)return;try{const res=await fetch(create?'/api/rooms':'/api/room',{method:create?'POST':'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,washers:Number(result.washers),dryers:Number(result.dryers)})});const data=await res.json();if(!res.ok)throw Error(typeof data.detail==='string'?data.detail:'Please check your input');if(create)changeRoom(data.code,result.passcode);else{toast('Room updated');refresh()}}catch(e){toast(e.message)}}
+async function rememberRoom(code, passcode) {
+  const res = await nativeFetch('/api/room/membership', {
+    method: 'POST',
+    headers: {'X-Room-Code': code, 'X-Room-Passcode': passcode},
+  });
+  if (res.status === 403) throw Error('Incorrect room code or passcode.');
+  if (!res.ok) throw Error('Unable to save room access. Please try again.');
+  const {token} = await res.json();
+  localStorage.setItem('loop-token-' + code, token);
+  sessionStorage.removeItem('loop-pass-' + code);
+  return token;
+}
+
+async function changeRoom(code, token) {
+  roomVersion++;
+  roomCode = code;
+  roomToken = token;
+  machines = [];
+  history.replaceState(null, '', location.pathname);
+  if (!await refresh()) return;
+  localStorage.setItem('loop-room', code);
+  $('#entry-screen').hidden = true;
+  $('main').hidden = false;
+  $('aside').hidden = false;
+  updateAlerts();
+  syncAlerts();
+}
+async function setupRoom(create){const name=document.querySelector('.date-card strong').textContent;const result=await formDialog(create?'Create a laundry room':'Edit laundry room',[{name:'name',label:'Room name',value:create?'':name},{name:'washers',label:'Number of washers',type:'number',value:create?3:machines.filter(m=>m.type==='washer').length},{name:'dryers',label:'Number of dryers',type:'number',value:create?3:machines.filter(m=>m.type==='dryer').length},...(create?[{name:'passcode',label:'Room passcode (6–128 characters, no spaces)',type:'password'}]:[])]);if(!result)return;try{const res=await roomRequest(create?'/api/rooms':'/api/room',{method:create?'POST':'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,washers:Number(result.washers),dryers:Number(result.dryers)})});const data=await res.json();if(!res.ok)throw Error(typeof data.detail==='string'?data.detail:'Please check your input');if(create)await changeRoom(data.code,await rememberRoom(data.code,result.passcode));else{toast('Room updated');refresh()}}catch(e){toast(e.message)}}
 $('#edit-room').onclick=()=>setupRoom(false);$('#create-room').onclick=()=>setupRoom(true);
 let accessOpen=false;
-async function showAccess(){if(accessOpen)return;accessOpen=true;const r=await formDialog('Join a laundry room',[{name:'code',label:'Room code',value:roomParam||roomCode||''},{name:'passcode',label:'Room passcode',type:'password'}]);accessOpen=false;if(!r)return;try{const code=r.code.trim().toUpperCase();const res=await nativeFetch('/api/state',{headers:{'X-Client-Id':client,'X-Room-Code':code,'X-Room-Passcode':r.passcode}});if(!res.ok)throw Error('Incorrect room code or passcode. For an existing room without a passcode, use Set up existing room.');changeRoom(code,r.passcode)}catch(e){toast(e.message)}}
-$('#join-room').onclick=showAccess;
-const legacyButton=document.createElement('button');legacyButton.textContent='Set up existing room';roomControls.append(legacyButton);legacyButton.onclick=async()=>{const r=await formDialog('Set a passcode for an existing room',[{name:'code',label:'Existing room code',value:roomCode},{name:'passcode',label:'New passcode (6–128 characters, no spaces)',type:'password'}]);if(!r)return;try{const code=r.code.trim().toUpperCase();const res=await nativeFetch(`/api/rooms/${encodeURIComponent(code)}/set-initial-passcode`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:r.passcode})});if(!res.ok)throw Error('Room not found, already protected, or invalid passcode.');changeRoom(code,r.passcode)}catch(e){toast(e.message)}};
+async function openRememberedRoom(code) {
+  if (!code) return false;
+  let token = localStorage.getItem('loop-token-' + code);
+  const legacyPasscode = sessionStorage.getItem('loop-pass-' + code);
+  if (!token && legacyPasscode) {
+    try {
+      token = await rememberRoom(code, legacyPasscode);
+    } catch {
+      sessionStorage.removeItem('loop-pass-' + code);
+    }
+  }
+  if (!token) return false;
+  await changeRoom(code, token);
+  return Boolean(roomToken);
+}
+
+async function showAccess(knownCode = '') {
+  if (accessOpen) return;
+  accessOpen = true;
+  try {
+    let code = knownCode;
+    if (!code) {
+      const selected = await formDialog('Join a laundry room', [{name: 'code', label: 'Room code'}]);
+      if (!selected) return;
+      code = selected.code.trim().toUpperCase();
+      if (!code) return;
+    }
+    if (await openRememberedRoom(code)) return;
+    const login = await formDialog(`Join room ${code}`, [{name: 'passcode', label: 'Room passcode', type: 'password'}]);
+    if (login) await changeRoom(code, await rememberRoom(code, login.passcode));
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    accessOpen = false;
+  }
+}
+$('#join-room').onclick=()=>showAccess();
+const legacyButton = document.createElement('button');
+legacyButton.textContent = 'Set up existing room';
+roomControls.append(legacyButton);
+legacyButton.onclick = async () => {
+  const code = roomCode;
+  if (!code) return;
+  const result = await formDialog(`Set a passcode for room ${code}`, [
+    {name: 'passcode', label: 'New passcode (6–128 characters, no spaces)', type: 'password'},
+  ]);
+  if (!result) return;
+  try {
+    const res = await nativeFetch(`/api/rooms/${encodeURIComponent(code)}/set-initial-passcode`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({passcode: result.passcode}),
+    });
+    if (!res.ok) throw Error('Room not found, already protected, or invalid passcode.');
+    await changeRoom(code, await rememberRoom(code, result.passcode));
+  } catch (error) {
+    toast(error.message);
+  }
+};
 $('#invite-room').onclick=()=>{const d=document.createElement('dialog');const url=new URL(location.href);url.search='?room='+encodeURIComponent(roomCode);url.hash='';d.innerHTML='<form method="dialog"><h2>Invite residents</h2><p>Share this code or link and give your housemates the passcode separately.</p><label>Room code<input readonly></label><label>Invite link<input readonly></label><button>Done</button></form>';const inputs=d.querySelectorAll('input');inputs[0].value=roomCode;inputs[1].value=url.href;document.body.append(d);d.addEventListener('close',()=>d.remove());d.showModal()};
 
-const entry=document.createElement('section');entry.id='entry-screen';entry.className='entry-screen';entry.innerHTML=`<div class="entry-card"><div class="entry-brand">◉ loop<span>.</span></div><div class="eyebrow">LAUNDRY, IN THE LOOP</div><h1>A little more flow<br><em>to your day.</em></h1><p>Keep track of shared laundry, without creating a profile.</p><div class="entry-actions"><button id="entry-create"><strong>Create a room</strong><span>Set up a space for your building or house</span><b>↗</b></button><button id="entry-join"><strong>Join a room</strong><span>Enter the room code and passcode</span><b>↗</b></button><button id="entry-return"><strong>Return to my room</strong><span>Open a room you joined on this browser</span><b>↗</b></button></div><p class="entry-message" role="status"></p></div>`;document.body.prepend(entry);
-function showEntry(message=''){document.querySelector('main').hidden=true;document.querySelector('aside').hidden=true;entry.hidden=false;entry.querySelector('.entry-message').textContent=message;const saved=localStorage.getItem('loop-room');const button=$('#entry-return');button.disabled=!saved;button.querySelector('span').textContent=saved?`Room ${saved} · passcode may be required`:'Join a room first to return here'}
-$('#entry-create').onclick=()=>setupRoom(true);$('#entry-join').onclick=showAccess;$('#entry-return').onclick=()=>{const saved=localStorage.getItem('loop-room');const pass=sessionStorage.getItem('loop-pass-'+saved);if(pass)changeRoom(saved,pass);else{roomCode=saved||'';showAccess()}};
-showEntry(roomParam?'You have an invitation. Choose Join a room to enter its passcode.':'');
-let installPrompt=null;const installButton=document.createElement('button');installButton.className='install-button';installButton.textContent='Add Loop to your home screen';document.querySelector('.entry-card').append(installButton);window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e});installButton.onclick=async()=>{if(installPrompt){const prompt=installPrompt;installPrompt=null;await prompt.prompt();await prompt.userChoice}else{toast('Use your browser menu and choose “Add to Home Screen” or “Install app”. On iPhone, use Share → Add to Home Screen.')}};window.addEventListener('appinstalled',()=>{installButton.hidden=true});if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+const entry=document.createElement('section');entry.id='entry-screen';entry.className='entry-screen';entry.innerHTML=`<div class="entry-card"><div class="entry-brand">◉ loop<span>.</span></div><div class="eyebrow">LAUNDRY, IN THE LOOP</div><h1>A little more flow<br><em>to your day.</em></h1><p>Keep track of shared laundry, without creating a profile.</p><div class="entry-actions"><button id="entry-create"><strong>Create a room</strong><span>Set up a space for your building or house</span><b>↗</b></button><button id="entry-join"><strong>Join a room</strong><span>Find a room by its code</span><b>↗</b></button><button id="entry-return"><strong>Return to my room</strong><span>Open a room you joined on this browser</span><b>↗</b></button></div><p class="entry-message" role="status"></p></div>`;document.body.prepend(entry);
+function showEntry(message=''){document.querySelector('main').hidden=true;document.querySelector('aside').hidden=true;entry.hidden=false;entry.querySelector('.entry-message').textContent=message;const saved=localStorage.getItem('loop-room');const button=$('#entry-return');button.disabled=!saved;button.querySelector('span').textContent=saved?`Room ${saved}`:'Join a room first to return here'}
+$('#entry-create').onclick = () => setupRoom(true);
+$('#entry-join').onclick = () => showAccess(roomParam);
+$('#entry-return').onclick = () => showAccess(localStorage.getItem('loop-room') || '');
+const startingRoom = roomParam || localStorage.getItem('loop-room');
+showEntry(roomParam ? 'You have a room invitation. Choose Join a room to continue.' : '');
+if (!params.has('home')) openRememberedRoom(startingRoom);
+let installPrompt=null;const installButton=document.createElement('button');installButton.className='install-button';installButton.textContent='Add Loop to your home screen';document.querySelector('.entry-card').append(installButton);window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e});installButton.onclick=async()=>{if(installPrompt){const prompt=installPrompt;installPrompt=null;await prompt.prompt();await prompt.userChoice}else{toast('Use your browser menu and choose “Add to Home Screen” or “Install app”. On iPhone, use Share → Add to Home Screen.')}};window.addEventListener('appinstalled',()=>{installButton.hidden=true});
