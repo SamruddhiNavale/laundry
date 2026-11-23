@@ -11,12 +11,14 @@ import sqlite3
 import time
 import unicodedata
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, utils
+import httpx
 from pywebpush import WebPushException, webpush
 from requests import Session
 from fastapi import FastAPI, HTTPException, Header, Request, Response
@@ -339,8 +341,15 @@ def transition(db):
 
 def record_worker_check():
     with connect() as db:
-        db.execute('INSERT INTO reminder_worker_status(id,checked_at) VALUES(1,?) '
-                   'ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at', (time.time(),))
+        now = time.time()
+        workers = [1]
+        if apns_configured():
+            workers.append(2)
+        if fcm_configured():
+            workers.append(3)
+        for worker in workers:
+            db.execute('INSERT INTO reminder_worker_status(id,checked_at) VALUES(?,?) '
+                       'ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at', (worker, now))
 
 
 @app.get('/api/state')
@@ -366,10 +375,13 @@ def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = 
                 m['turn_deadline'] = queue[0]['deadline']
             machines.append(m)
         device = db.execute('SELECT 1 FROM push_devices WHERE client=?', (client,)).fetchone()
-        worker = db.execute('SELECT checked_at FROM reminder_worker_status WHERE id=1').fetchone()
+        workers = {
+            row['id'] for row in db.execute('SELECT id FROM reminder_worker_status WHERE checked_at>=?',
+                                             (time.time() - WORKER_STATUS_TTL,))
+        }
         return {'machines': machines, 'room': {'code': room['code'], 'name': room['name']},
                 'push_registered': device is not None,
-                'worker_active': worker is not None and worker['checked_at'] >= time.time() - WORKER_STATUS_TTL}
+                'worker_active': 1 in workers, 'apns_active': 2 in workers, 'fcm_active': 3 in workers}
 
 
 @app.post('/api/machines/{machine_id}/{action}')
@@ -453,10 +465,27 @@ class PushDevice(BaseModel):
     keys: PushKeys
 
 
+class NativePushDevice(BaseModel):
+    token: str = Field(pattern=r'^(?:[0-9a-f]{2}){16,256}$')
+    sandbox: bool = False
+
+
+class AndroidPushDevice(BaseModel):
+    token: str = Field(pattern=r'^[A-Za-z0-9:_-]{16,1024}$')
+
+
+def save_push_device(client, code, token, subscription):
+    with connect() as db:
+        get_room(db, code, token)
+        db.execute('INSERT INTO push_devices(client,subscription) VALUES(?,?) '
+                   'ON CONFLICT(client) DO UPDATE SET subscription=excluded.subscription',
+                   (client_id(client), subscription))
+    return {'ok': True}
+
+
 @app.put('/api/push/device')
 def register_push(body: PushDevice, x_client_id: str = Header(), x_room_code: str = Header(),
                   x_room_token: str = Header()):
-    client = client_id(x_client_id)
     # Only contact browser push providers.
     try:
         url = urlsplit(body.endpoint)
@@ -468,12 +497,21 @@ def register_push(body: PushDevice, x_client_id: str = Header(), x_room_code: st
         valid = False
     if not valid:
         raise HTTPException(422, 'Unsupported browser push service')
-    with connect() as db:
-        get_room(db, x_room_code, x_room_token)
-        db.execute('INSERT INTO push_devices(client,subscription) VALUES(?,?) '
-                   'ON CONFLICT(client) DO UPDATE SET subscription=excluded.subscription',
-                   (client, body.model_dump_json()))
-    return {'ok': True}
+    return save_push_device(x_client_id, x_room_code, x_room_token, body.model_dump_json())
+
+
+@app.put('/api/push/ios')
+def register_native_push(body: NativePushDevice, x_client_id: str = Header(), x_room_code: str = Header(),
+                         x_room_token: str = Header()):
+    return save_push_device(x_client_id, x_room_code, x_room_token,
+                            json.dumps({'provider': 'apns', **body.model_dump()}))
+
+
+@app.put('/api/push/android')
+def register_android_push(body: AndroidPushDevice, x_client_id: str = Header(), x_room_code: str = Header(),
+                          x_room_token: str = Header()):
+    return save_push_device(x_client_id, x_room_code, x_room_token,
+                            json.dumps({'provider': 'fcm', **body.model_dump()}))
 
 
 @app.delete('/api/push/device')
@@ -485,11 +523,103 @@ def unregister_push(x_client_id: str = Header(), x_room_code: str = Header(),
     return {'ok': True}
 
 
+def base64url(value):
+    return base64.urlsafe_b64encode(value).rstrip(b'=').decode()
+
+
+APNS_VARIABLES = ('APNS_TEAM_ID', 'APNS_KEY_ID', 'APNS_PRIVATE_KEY', 'APNS_BUNDLE_ID')
+APNS_SUBSCRIPTION = '{"provider": "apns",%'
+FCM_SUBSCRIPTION = '{"provider": "fcm",%'
+
+
+def apns_configured():
+    return all(os.environ.get(name) for name in APNS_VARIABLES)
+
+
+def fcm_configured():
+    project = os.environ.get('FCM_PROJECT_ID', '')
+    return bool(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', project) and (
+        os.environ.get('FCM_SERVICE_ACCOUNT_JSON') or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    ))
+
+
+@lru_cache(maxsize=2)
+def fcm_session(account_json, credentials_file):
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2.service_account import Credentials
+    scopes = ['https://www.googleapis.com/auth/firebase.messaging']
+    credentials = (Credentials.from_service_account_info(json.loads(account_json), scopes=scopes)
+                   if account_json else Credentials.from_service_account_file(credentials_file, scopes=scopes))
+    return AuthorizedSession(credentials, refresh_timeout=5)
+
+
+def deliver_fcm(subscription, data, ttl):
+    if not fcm_configured():
+        raise RuntimeError('Firebase push credentials are missing on the reminder worker.')
+    session = fcm_session(os.environ.get('FCM_SERVICE_ACCOUNT_JSON'), os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'))
+    project = os.environ['FCM_PROJECT_ID']
+    message = {name: str(value) for name, value in data.items() if value is not None}
+    result = session.post(
+        f'https://fcm.googleapis.com/v1/projects/{project}/messages:send', timeout=5,
+        allow_redirects=False, json={'message': {
+            'token': subscription['token'],
+            'data': message,
+            'android': {'priority': 'HIGH', 'ttl': f'{ttl}s'},
+        }},
+    )
+    if result.ok:
+        return
+    try:
+        details = result.json().get('error', {}).get('details', [])
+        unregistered = any(detail.get('errorCode') == 'UNREGISTERED' for detail in details)
+    except (ValueError, AttributeError):
+        unregistered = False
+    if unregistered:
+        result.status_code = 410
+    elif result.status_code == 404:
+        # A wrong Firebase project must not invalidate an otherwise valid device token.
+        result.status_code = 502
+    raise WebPushException('Firebase rejected the push notification', response=result)
+
+
+@lru_cache(maxsize=4)
+def apns_bearer(team, key_id, pem, issued_at):
+    private = serialization.load_pem_private_key(pem.encode(), password=None)
+    header = base64url(json.dumps({'alg': 'ES256', 'kid': key_id}).encode())
+    claims = base64url(json.dumps({'iss': team, 'iat': issued_at}).encode())
+    content = f'{header}.{claims}'
+    signature = private.sign(content.encode(), ec.ECDSA(hashes.SHA256()))
+    r, s = utils.decode_dss_signature(signature)
+    return f'{content}.{base64url(r.to_bytes(32, "big") + s.to_bytes(32, "big"))}'
+
+
+def deliver_apns(subscription, data, ttl):
+    if not apns_configured():
+        raise RuntimeError('Apple push credentials are missing on the reminder worker.')
+    team, key_id, pem, topic = (os.environ[name] for name in APNS_VARIABLES)
+    now = int(time.time())
+    bearer = apns_bearer(team, key_id, pem.replace('\\n', '\n'), now // 2400 * 2400)
+    host = 'api.sandbox.push.apple.com' if subscription['sandbox'] else 'api.push.apple.com'
+    title = 'Your laundry turn' if data.get('kind') == 'turn' else 'Laundry pickup reminder'
+    with httpx.Client(http2=True, timeout=5) as client:
+        response = client.post(f'https://{host}/3/device/{subscription["token"]}', headers={
+            'authorization': f'bearer {bearer}', 'apns-topic': topic, 'apns-push-type': 'alert',
+            'apns-expiration': str(now + ttl),
+        }, json={'aps': {'alert': {'title': title, 'body': data['body']}, 'sound': 'default'}, **data})
+    if not response.is_success:
+        raise WebPushException('Apple rejected the push notification', response=response)
+
+
 def deliver_push(subscription, key, data, ttl):
+    device = json.loads(subscription)
+    if device.get('provider') == 'apns':
+        return deliver_apns(device, data, ttl)
+    if device.get('provider') == 'fcm':
+        return deliver_fcm(device, data, ttl)
     with Session() as session:
         session.max_redirects = 0
         webpush(
-            subscription_info=json.loads(subscription),
+            subscription_info=device,
             data=json.dumps(data),
             vapid_private_key=key,
             vapid_claims={'sub': os.environ.get('LAUNDRY_PUSH_CONTACT', 'https://example.com')},
@@ -506,8 +636,10 @@ def send_turn_alerts():
             FROM queue_turns t JOIN queue q ON q.id=t.queue_id JOIN machines m ON m.id=q.machine_id
             JOIN push_devices p ON p.client=q.client
             WHERE t.notified=FALSE AND m.state='free'
+              AND (? OR p.subscription NOT LIKE ?)
+              AND (? OR p.subscription NOT LIKE ?)
             ORDER BY t.deadline,t.queue_id LIMIT 20
-        """))
+        """, (apns_configured(), APNS_SUBSCRIPTION, fcm_configured(), FCM_SUBSCRIPTION)))
         if not pending:
             return
         key = push_keys(db)['private_key']
@@ -553,9 +685,11 @@ def send_due_reminders():
             SELECT m.id, m.name, m.room, m.owner, m.end, p.subscription
             FROM machines m JOIN push_devices p ON p.client=m.owner
             WHERE m.state='done' AND (m.next_reminder IS NULL OR m.next_reminder<=?)
+              AND (? OR p.subscription NOT LIKE ?)
+              AND (? OR p.subscription NOT LIKE ?)
               AND NOT EXISTS (SELECT 1 FROM left_rooms l WHERE l.room=m.room AND l.client=m.owner)
             ORDER BY m.next_reminder LIMIT 20
-        """, (now,)))
+        """, (now, apns_configured(), APNS_SUBSCRIPTION, fcm_configured(), FCM_SUBSCRIPTION)))
         if not pending:
             return
         key = push_keys(db)['private_key']
@@ -607,6 +741,11 @@ def index():
             "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         ),
     })
+
+@app.get('/privacy')
+def privacy():
+    return FileResponse(ROOT / 'privacy.html')
+
 
 @app.get('/{asset}')
 def asset(asset: str):

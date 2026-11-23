@@ -3,3 +3,7 @@ fastapi[standard]>=0.128.8,<1.0
 psycopg[binary]>=3.2,<4
 
 pywebpush>=2,<3
+
+httpx[http2]>=0.28,<1
+
+google-auth>=2.40,<3

@@ -2,6 +2,8 @@
 
 Loop helps residents share washers and dryers. Each room has its own machines and first-in, first-out queues. The app uses FastAPI, SQLite or PostgreSQL, and a browser frontend that can be installed on a phone's home screen.
 
+The [native iPhone, iPad, and Android apps](mobile/RELEASE.md) use the same rooms and queues, with device-secured saved access and native push notifications.
+
 ## Run locally
 
 Use Python 3.13 to match the container, or a compatible Python version.

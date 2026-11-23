@@ -167,6 +167,75 @@ class LaundryTests(unittest.TestCase):
         with patch.object(self.server.time, 'time', return_value=10121):
             self.assertFalse(worker_active())
 
+    def test_native_push_registration_waits_for_apple_worker_and_sends_one_turn_alert(self):
+        headers = dict(self.b)
+        device = {'token': 'ab' * 32, 'sandbox': True}
+        self.assertEqual(self.c.put('/api/push/ios', headers={
+            **headers, 'X-Room-Token': 'invalid',
+        }, json=device).status_code, 403)
+        self.assertEqual(self.c.put('/api/push/ios', headers=headers, json={**device, 'token': 'wrong'}).status_code, 422)
+        self.assertEqual(self.c.put('/api/push/ios', headers=headers, json=device).status_code, 200)
+        self.start()
+        self.post('queue', self.b)
+        self.post('finish')
+        self.post('clear')
+        with patch.object(self.server, 'apns_configured', return_value=False), patch.object(self.server, 'deliver_push') as send:
+            self.server.send_turn_alerts()
+            send.assert_not_called()
+        private = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+        ).decode()
+        config = {'APNS_TEAM_ID': 'example-team', 'APNS_KEY_ID': 'example-key',
+                  'APNS_PRIVATE_KEY': private, 'APNS_BUNDLE_ID': 'com.example.loop'}
+        with patch.dict(os.environ, config), patch.object(self.server.httpx, 'Client') as client:
+            send = client.return_value.__enter__.return_value.post
+            send.return_value.status_code = 200
+            send.return_value.is_success = True
+            self.server.send_turn_alerts()
+            self.server.send_turn_alerts()
+            self.server.record_worker_check()
+            send.assert_called_once()
+            args, kwargs = send.call_args
+            self.assertEqual(args[0], 'https://api.sandbox.push.apple.com/3/device/' + device['token'])
+            self.assertEqual(kwargs['headers']['apns-topic'], config['APNS_BUNDLE_ID'])
+            self.assertEqual(kwargs['json']['kind'], 'turn')
+            self.assertEqual(kwargs['json']['aps']['alert']['title'], 'Your laundry turn')
+            self.assertTrue(kwargs['headers']['authorization'].startswith('bearer '))
+            self.assertTrue(self.c.get('/api/state', headers=headers).json()['apns_active'])
+
+    def test_android_push_registration_and_fcm_data_message(self):
+        token = 'example-device:firebase-token_123'
+        self.assertEqual(self.c.put('/api/push/android', headers=self.a, json={'token': 'invalid'}).status_code, 422)
+        self.assertEqual(self.c.put('/api/push/android', headers={
+            **self.a, 'X-Room-Token': 'invalid',
+        }, json={'token': token}).status_code, 403)
+        self.assertEqual(self.c.put('/api/push/android', headers=self.a, json={'token': token}).status_code, 200)
+        self.start()
+        self.post('finish')
+        with patch.object(self.server, 'fcm_configured', return_value=False), patch.object(self.server, 'deliver_fcm') as send:
+            self.server.send_due_reminders()
+            send.assert_not_called()
+        with patch.dict(os.environ, {'FCM_PROJECT_ID': 'loop-test', 'FCM_SERVICE_ACCOUNT_JSON': '{}'}):
+            with patch.object(self.server, 'fcm_session') as session:
+                send = session.return_value.post
+                send.return_value.ok = True
+                self.server.send_due_reminders()
+                self.server.send_due_reminders()
+                send.assert_called_once()
+                args, kwargs = send.call_args
+                self.assertEqual(args[0], 'https://fcm.googleapis.com/v1/projects/loop-test/messages:send')
+                message = kwargs['json']['message']
+                self.assertEqual(message['token'], token)
+                self.assertEqual(message['data']['machine'], '1')
+                self.assertEqual(message['android'], {'priority': 'HIGH', 'ttl': '900s'})
+                self.server.record_worker_check()
+                self.assertTrue(self.c.get('/api/state', headers=self.a).json()['fcm_active'])
+
+    def test_public_mobile_privacy_policy(self):
+        response = self.c.get('/privacy')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Loop Laundry Privacy Policy', response.text)
+
     def test_reminder_timing_and_yes_no(self):
         with patch.object(self.server.time, 'time', return_value=10000):
             self.start(minutes=1)
