@@ -107,6 +107,54 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(self.start(self.d).status_code, 200)
         self.assertEqual(self.state(self.d)['queue_length'], 0)
 
+    def test_queue_turn_expires_and_gives_next_resident_a_full_hour(self):
+        with patch.object(self.server.time, 'time', return_value=10000):
+            self.start()
+            self.post('queue', self.b)
+            self.post('queue', self.d)
+            self.assertIsNone(self.state(self.b)['turn_deadline'])
+            self.post('finish')
+            self.post('clear')
+            self.assertEqual(self.state(self.b)['turn_deadline'], 13600)
+        with patch.object(self.server.time, 'time', return_value=13599):
+            self.assertEqual(self.state(self.b)['queue_position'], 1)
+            self.assertEqual(self.start(self.d).status_code, 409)
+        with patch.object(self.server.time, 'time', return_value=13600):
+            self.assertEqual(self.start(self.b).status_code, 409)
+            self.assertIsNone(self.state(self.b)['queue_position'])
+            self.assertEqual(self.state(self.d)['queue_position'], 1)
+            self.assertEqual(self.state(self.d)['turn_deadline'], 17200)
+            stale_leave = {**self.b, 'X-Queue-Intent': 'leave'}
+            self.assertEqual(self.post('queue', stale_leave).status_code, 200)
+            self.assertIsNone(self.state(self.b)['queue_position'])
+        with patch.object(self.server.time, 'time', return_value=17200):
+            self.assertEqual(self.state()['queue_length'], 0)
+            self.assertEqual(self.start().status_code, 200)
+
+    def test_each_promoted_resident_gets_one_turn_push(self):
+        with self.server.connect() as db:
+            db.executemany('INSERT INTO push_devices(client,subscription) VALUES(?,?)',
+                           [('bob', 'bob-subscription'), ('dana', 'dana-subscription')])
+        with patch.object(self.server.time, 'time', return_value=10000), patch.object(self.server, 'deliver_push') as deliver:
+            self.start()
+            self.post('queue', self.b)
+            self.post('queue', self.d)
+            self.post('finish')
+            self.server.send_turn_alerts()
+            deliver.assert_not_called()
+            self.post('clear')
+            self.server.send_turn_alerts()
+            self.server.send_turn_alerts()
+            deliver.assert_called_once()
+            self.assertEqual(deliver.call_args.args[0], 'bob-subscription')
+            self.assertEqual(deliver.call_args.args[2]['kind'], 'turn')
+        with patch.object(self.server.time, 'time', return_value=13600), patch.object(self.server, 'deliver_push') as deliver:
+            self.server.send_turn_alerts()
+            self.server.send_turn_alerts()
+            deliver.assert_called_once()
+            self.assertEqual(deliver.call_args.args[0], 'dana-subscription')
+            self.assertEqual(deliver.call_args.args[2]['deadline'], 17200)
+
     def test_reminder_timing_and_yes_no(self):
         with patch.object(self.server.time, 'time', return_value=10000):
             self.start(minutes=1)

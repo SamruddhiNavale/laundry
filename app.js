@@ -44,16 +44,11 @@ async function refresh() {
     updateRoom(data.room);
     for (const m of machines) {
       const key = `loop-turn-${roomCode}-${m.id}`;
-      if (m.state === 'free' && m.queue_position === 1) {
-        if (!localStorage.getItem(key)) {
-          localStorage.setItem(key, 'shown');
-          const body = 'It’s your turn. Start your load when you’re ready.';
-          toast(body);
-          if (alertsEnabled() && window.Notification?.permission === 'granted') {
-            registration.then(worker => worker?.showNotification(`${m.name} is available`, {
-              body, icon: '/icon-192.png', data: {room: data.room.code},
-            })).catch(console.warn);
-          }
+      if (m.turn_deadline) {
+        const offer = String(m.turn_deadline);
+        if (localStorage.getItem(key) !== offer) {
+          localStorage.setItem(key, offer);
+          toast(`It’s your turn for ${m.name}. Start before your one-hour reservation expires.`);
         }
       } else {
         localStorage.removeItem(key);
@@ -69,10 +64,10 @@ async function refresh() {
 }
 function render(){for(const type of ['washer','dryer'])$(`#${type==='washer'?'wash':'dry'}-count`).innerHTML=`${machines.filter(m=>m.type===type&&m.state==='free'&&!m.queue_length).length} <span>/ ${machines.filter(m=>m.type===type).length}</span>`;const queued=machines.filter(m=>m.queue_position);$('#queue-count').textContent=queued.length;$('#queue-badge').textContent=`${queued.length} waiting`;
 $('#machine-grid').innerHTML=machines.filter(m=>filter==='all'||m.type===filter).map(m=>{const minutes=Math.max(1,Math.ceil((m.end*1000-Date.now())/60000));const reserved=m.state==='free'&&m.queue_length;const detail=m.state==='free'?(reserved?'Reserved for the next person':'Ready for your next load'):m.state==='done'?`Cycle finished · ${m.mine?'your clothes':'clothes may remain'}`:`${m.mine?'Your cycle':'In use'} · <strong>~${minutes} min left</strong>`;let button=m.state==='free'&&(!reserved||m.queue_position===1)?`<button data-action="start" data-id="${m.id}">Start a load ↗</button>`:m.mine&&m.state==='done'?`<button data-action="clear" data-id="${m.id}">Clothes picked up ✓</button>`:m.mine?`<button class="secondary" data-action="finish" data-id="${m.id}">End cycle</button>`:m.state==='free'&&m.queue_position?`<span>In queue · position ${m.queue_position}</span>`:`<button class="secondary" data-action="queue" data-id="${m.id}">${m.queue_position?'Leave queue':'Join queue'} ${m.queue_position?'−':'+'}</button>`;return `<article class="machine ${m.type}"><div class="card-top"><span class="machine-type">${m.type.toUpperCase()}</span><span class="status ${m.state==='busy'?'busy':m.state==='done'?'done':''}">● ${m.state==='free'?(reserved?'Reserved':'Available'):m.state==='done'?'Cycle complete':'In use'}</span></div><div class="machine-body"><div class="machine-illustration"></div><div><h3>${m.name}</h3><div class="machine-detail">${detail}</div></div></div><div class="card-bottom"><span>${m.queue_length?`${m.queue_length} in queue`:m.state==='free'?'Ready to go':m.state==='done'?'Waiting for pickup':'Running now'}</span><div class="machine-actions">${button}${m.state==='done'&&!m.mine?`<button class="force-stop" data-action="force-stop" data-id="${m.id}">Force stop</button>`:''}</div></div></article>`}).join('');
-$('#queue-list').innerHTML=queued.length?queued.map(m=>`<div class="queue-row"><div><strong>${m.name}</strong><small>${m.state==='free'&&m.queue_position===1?'Available now · your turn':`Position ${m.queue_position} in line`}</small></div><button data-action="queue" data-id="${m.id}">Leave queue</button></div>`).join(''):'<div class="empty">No waiting around here. Join a queue on a busy machine and your spot will show up here.</div>'}
+$('#queue-list').innerHTML=queued.length?queued.map(m=>`<div class="queue-row"><div><strong>${m.name}</strong><small>${m.turn_deadline?`Your turn · ${Math.max(1, Math.ceil((m.turn_deadline * 1000 - Date.now()) / 60000))} min left`:`Position ${m.queue_position} in line`}</small></div><button data-action="queue" data-id="${m.id}">Leave queue</button></div>`).join(''):'<div class="empty">No waiting around here. Join a queue on a busy machine and your spot will show up here.</div>'}
 document.addEventListener('click',async e=>{const f=e.target.closest('[data-filter]');if(f){filter=f.dataset.filter;document.querySelectorAll('[data-filter]').forEach(b=>b.classList.toggle('selected',b===f));render();return}const b=e.target.closest('[data-action]');if(!b)return;const m=machines.find(x=>x.id===Number(b.dataset.id));if(!m)return;const version=roomVersion;
 if(b.dataset.action==='force-stop'&&!window.confirm(`Release ${m.name}? Check that the cycle is finished and the drum is empty first. The queue will be kept.`))return;
-let body;if(b.dataset.action==='start'){const raw=await cyclePrompt(`How many minutes will ${m.name} run?`,m.type==='washer'?'35':'45');if(raw===null)return;const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240){toast('Enter a whole number between 1 and 240 minutes.');return}body=JSON.stringify({minutes})}if(version!==roomVersion)return;b.disabled=true;try{const res=await roomRequest(`/api/machines/${m.id}/${b.dataset.action}`,{method:'POST',headers:{'X-Client-Id':client,'Content-Type':'application/json',...(['finish','clear','force-stop'].includes(b.dataset.action)?{'X-Cycle-End':String(m.end)}:{})},body});const result=await res.json();if(!res.ok)throw Error(result.detail||'Request failed');if(b.dataset.action!=='finish')toast(['clear','force-stop'].includes(b.dataset.action)?`${m.name} was released.`:'Your update was saved.');await refresh()}catch(e){toast(e.message);await refresh()}});
+let body;if(b.dataset.action==='start'){const raw=await cyclePrompt(`How many minutes will ${m.name} run?`,m.type==='washer'?'35':'45');if(raw===null)return;const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240){toast('Enter a whole number between 1 and 240 minutes.');return}body=JSON.stringify({minutes})}if(version!==roomVersion)return;b.disabled=true;try{const res=await roomRequest(`/api/machines/${m.id}/${b.dataset.action}`,{method:'POST',headers:{'X-Client-Id':client,'Content-Type':'application/json',...(b.dataset.action==='queue'?{'X-Queue-Intent':m.queue_position?'leave':'join'}:{}),...(['finish','clear','force-stop'].includes(b.dataset.action)?{'X-Cycle-End':String(m.end)}:{})},body});const result=await res.json();if(!res.ok)throw Error(result.detail||'Request failed');if(b.dataset.action!=='finish')toast(['clear','force-stop'].includes(b.dataset.action)?`${m.name} was released.`:'Your update was saved.');await refresh()}catch(e){toast(e.message);await refresh()}});
 const alertsButton = $('#notifications');
 const registration = 'serviceWorker' in navigator
   ? navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).catch(() => null)

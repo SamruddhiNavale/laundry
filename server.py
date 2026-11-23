@@ -13,7 +13,7 @@ import time
 import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
@@ -28,12 +28,14 @@ from pydantic import BaseModel, Field, field_validator
 ROOT = Path(__file__).resolve().parent
 DB = os.environ.get('LAUNDRY_DB', str(ROOT / 'laundry.db'))
 DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL')
+TURN_SECONDS = 3600
 logger = logging.getLogger(__name__)
 
 
 async def reminder_worker():
     while True:
         try:
+            await asyncio.to_thread(send_turn_alerts)
             await asyncio.to_thread(send_due_reminders)
         except Exception:
             logger.exception('Laundry reminder worker failed')
@@ -141,6 +143,7 @@ def initialize():
 
 
 def initialize_access(db):
+    db.execute('CREATE TABLE IF NOT EXISTS queue_turns (queue_id INTEGER PRIMARY KEY REFERENCES queue(id) ON DELETE CASCADE, deadline DOUBLE PRECISION NOT NULL, notified BOOLEAN NOT NULL DEFAULT FALSE)')
     db.execute('CREATE TABLE IF NOT EXISTS left_rooms (room TEXT NOT NULL REFERENCES rooms(code), client TEXT NOT NULL, PRIMARY KEY(room,client))')
     db.execute('CREATE TABLE IF NOT EXISTS room_memberships (token_hash TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(code))')
     db.execute('CREATE TABLE IF NOT EXISTS push_devices (client TEXT PRIMARY KEY, subscription TEXT NOT NULL)')
@@ -249,6 +252,7 @@ def leave_room(x_room_code: str = Header(), x_room_token: str = Header(),
                    (token_hash(x_room_token), code))
         db.execute('DELETE FROM queue WHERE client=? AND machine_id IN (SELECT id FROM machines WHERE room=?)',
                    (client, code))
+        offer_queue_turns(db, time.time())
         db.execute('INSERT INTO left_rooms(room,client) VALUES(?,?) ON CONFLICT DO NOTHING',
                    (code, client))
     return {'ok': True}
@@ -335,8 +339,20 @@ def client_id(value: Optional[str]):
     return value
 
 
+def offer_queue_turns(db, now):
+    db.execute("""
+        INSERT INTO queue_turns(queue_id, deadline)
+        SELECT MIN(q.id), ? FROM queue q JOIN machines m ON m.id=q.machine_id
+        WHERE m.state='free' GROUP BY q.machine_id
+        ON CONFLICT(queue_id) DO NOTHING
+    """, (now + TURN_SECONDS,))
+
+
 def transition(db):
-    db.execute("UPDATE machines SET state='done', next_reminder=end WHERE state='busy' AND end <= ?", (time.time(),))
+    now = time.time()
+    db.execute("UPDATE machines SET state='done', next_reminder=end WHERE state='busy' AND end <= ?", (now,))
+    db.execute('DELETE FROM queue WHERE id IN (SELECT queue_id FROM queue_turns WHERE deadline<=?)', (now,))
+    offer_queue_turns(db, now)
 
 
 @app.get('/api/state')
@@ -353,9 +369,13 @@ def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = 
             m['mine'] = m.pop('owner') == client
             if not m['mine']:
                 m.pop('next_reminder')
-            queue = list(db.execute('SELECT client FROM queue WHERE machine_id=? ORDER BY id', (m['id'],)))
+            queue = list(db.execute(
+                'SELECT q.client,t.deadline FROM queue q LEFT JOIN queue_turns t ON t.queue_id=q.id '
+                'WHERE q.machine_id=? ORDER BY q.id', (m['id'],)))
             m['queue_length'] = len(queue)
             m['queue_position'] = next((i for i, q in enumerate(queue, 1) if q['client'] == client), None)
+            if m['queue_position'] == 1:
+                m['turn_deadline'] = queue[0]['deadline']
             machines.append(m)
         device = db.execute('SELECT 1 FROM push_devices WHERE client=?', (client,)).fetchone()
         return {'machines': machines, 'room': {'code': room['code'], 'name': room['name']},
@@ -363,7 +383,7 @@ def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = 
 
 
 @app.post('/api/machines/{machine_id}/{action}')
-def action(machine_id: int, action: str, payload: Optional[Start] = None, x_client_id: Optional[str] = Header(default=None), x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None), x_room_token: Optional[str] = Header(default=None), x_cycle_end: Optional[float] = Header(default=None)):
+def action(machine_id: int, action: str, payload: Optional[Start] = None, x_client_id: Optional[str] = Header(default=None), x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None), x_room_token: Optional[str] = Header(default=None), x_cycle_end: Optional[float] = Header(default=None), x_queue_intent: Optional[Literal['join', 'leave']] = Header(default=None)):
     client = client_id(x_client_id)
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -389,6 +409,7 @@ def action(machine_id: int, action: str, payload: Optional[Start] = None, x_clie
             if action == 'force-stop' and (row['state'] != 'done' or x_cycle_end is None):
                 raise HTTPException(409, 'This completed cycle is no longer available to release')
             db.execute("UPDATE machines SET state='free',owner=NULL,end=NULL,next_reminder=NULL WHERE id=?", (machine_id,))
+            offer_queue_turns(db, time.time())
         elif action == 'remind':
             if row['state'] != 'done' or row['owner'] != client: raise HTTPException(403, 'Only the cycle owner can receive this reminder')
             if db.execute('SELECT 1 FROM push_devices WHERE client=?', (client,)).fetchone():
@@ -400,7 +421,12 @@ def action(machine_id: int, action: str, payload: Optional[Start] = None, x_clie
             db.execute('UPDATE machines SET next_reminder=? WHERE id=?', (time.time()+3600,machine_id))
         elif action == 'queue':
             existing = db.execute('SELECT id FROM queue WHERE machine_id=? AND client=?', (machine_id,client)).fetchone()
-            if existing: db.execute('DELETE FROM queue WHERE id=?', (existing['id'],))
+            if existing:
+                if x_queue_intent != 'join':
+                    db.execute('DELETE FROM queue WHERE id=?', (existing['id'],))
+                    offer_queue_turns(db, time.time())
+            elif x_queue_intent == 'leave':
+                return {'ok': True}
             elif row['state'] == 'free' and not db.execute('SELECT 1 FROM queue WHERE machine_id=?', (machine_id,)).fetchone(): raise HTTPException(409, 'This machine is available')
             elif row['owner'] == client: raise HTTPException(409, 'You are using this machine')
             else: db.execute('INSERT INTO queue(machine_id,client) VALUES(?,?)', (machine_id,client))
@@ -469,6 +495,65 @@ def unregister_push(x_client_id: str = Header(), x_room_code: str = Header(),
     return {'ok': True}
 
 
+def deliver_push(subscription, key, data, ttl):
+    with Session() as session:
+        session.max_redirects = 0
+        webpush(
+            subscription_info=json.loads(subscription),
+            data=json.dumps(data),
+            vapid_private_key=key,
+            vapid_claims={'sub': os.environ.get('LAUNDRY_PUSH_CONTACT', 'https://example.com')},
+            ttl=ttl, timeout=5, requests_session=session,
+        )
+
+
+def send_turn_alerts():
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        transition(db)
+        pending = list(db.execute("""
+            SELECT t.queue_id,t.deadline,q.client,m.id,m.name,m.room,p.subscription
+            FROM queue_turns t JOIN queue q ON q.id=t.queue_id JOIN machines m ON m.id=q.machine_id
+            JOIN push_devices p ON p.client=q.client
+            WHERE t.notified=FALSE AND m.state='free'
+            ORDER BY t.deadline,t.queue_id LIMIT 20
+        """))
+        if not pending:
+            return
+        key = push_keys(db)['private_key']
+        for turn in pending:
+            db.execute('UPDATE queue_turns SET notified=TRUE WHERE queue_id=?', (turn['queue_id'],))
+
+    for turn in pending:
+        ttl = int(turn['deadline'] - time.time())
+        if ttl <= 0:
+            continue
+        with connect() as db:
+            current = db.execute("""
+                SELECT 1 FROM queue_turns t JOIN queue q ON q.id=t.queue_id
+                JOIN push_devices p ON p.client=q.client
+                WHERE t.queue_id=? AND p.subscription=?
+            """, (turn['queue_id'], turn['subscription'])).fetchone()
+        if not current:
+            continue
+        try:
+            deliver_push(turn['subscription'], key, {
+                'kind': 'turn', 'room': turn['room'], 'machine': turn['id'],
+                'turn': turn['queue_id'], 'deadline': turn['deadline'],
+                'body': f"{turn['name']} is available. Start before your one-hour turn expires.",
+            }, ttl)
+        except WebPushException as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (404, 410):
+                with connect() as db:
+                    db.execute('DELETE FROM push_devices WHERE client=? AND subscription=?',
+                               (turn['client'], turn['subscription']))
+            else:
+                logger.warning('Queue alert failed for machine %s (status %s)', turn['id'], status)
+        except Exception:
+            logger.warning('Queue alert failed for machine %s', turn['id'])
+
+
 def send_due_reminders():
     now = time.time()
     with connect() as db:
@@ -499,16 +584,10 @@ def send_due_reminders():
         if not current:
             continue
         try:
-            with Session() as session:
-                session.max_redirects = 0
-                webpush(
-                    subscription_info=json.loads(m['subscription']),
-                    data=json.dumps({'room': m['room'], 'machine': m['id'], 'end': m['end'],
-                                     'body': f"{m['name']} has finished. Have you removed your clothes?"}),
-                    vapid_private_key=key,
-                    vapid_claims={'sub': os.environ.get('LAUNDRY_PUSH_CONTACT', 'https://example.com')},
-                    ttl=900, timeout=5, requests_session=session,
-                )
+            deliver_push(m['subscription'], key, {
+                'room': m['room'], 'machine': m['id'], 'end': m['end'],
+                'body': f"{m['name']} has finished. Have you removed your clothes?",
+            }, 900)
         except WebPushException as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status in (404, 410):

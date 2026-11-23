@@ -19,12 +19,12 @@ Open [Loop Laundry](http://127.0.0.1:8001/) in your browser. The local server is
 1. **Create a room** with a unique name, machine counts, and a passcode of 6–128 characters. Spaces and Unicode are accepted. A name that differs only in capitalization or surrounding spaces is already taken.
 2. Open **Invite residents** to copy the room link or code. Share the passcode separately. Residents can follow the invite or choose **Join a room** and type the code.
 3. Use the top-left Loop icon to go home. **Return to my room** opens the last room with saved access on that browser. The arrow beside the current room opens the saved-room menu. On smaller screens it sits in the header. Use **Leave room** to remove saved access, queue spots, and future reminders for that room on this device.
-4. On a free machine, choose **Start a load** and enter the duration. On a busy machine, choose **Join queue**. The first resident in line can start once the previous load is picked up. Queue-turn alerts appear while the room is open.
+4. On a free machine, choose **Start a load** and enter the duration. On a busy machine, choose **Join queue**. The first resident in line can start once the previous load is picked up. The first resident receives a turn alert and has one hour to start. After that, Loop removes their queue spot and gives the next resident a fresh hour. With device notifications enabled and the worker running, the turn alert can arrive while Loop is closed.
 5. At pickup, choose **Clothes picked up** to release the machine, or **No, still there** in the reminder to defer it for an hour. If someone has already removed their clothes and forgotten to confirm, check that the drum is empty and use **Force stop** on the completed cycle. The existing queue keeps its order.
 
 **Edit room** changes the room name and machine counts. Machines in use or with a queue must be released before you reduce the count. **Change room passcode** requires the current passcode. New joins use the updated passcode, while previously joined browsers retain access.
 
-Access and laundry ownership are tied to the current browser profile. A different device, a private window, or clearing site data means joining again. Use separate browser profiles to simulate two residents. A first-in-line reservation currently lasts until that resident starts a load or leaves the queue.
+Access and laundry ownership are tied to the current browser profile. A different device, a private window, or clearing site data means joining again. Use separate browser profiles to simulate two residents. The one-hour window starts when a machine is released and the resident reaches the front of the queue.
 
 ## Mobile pickup reminders
 
