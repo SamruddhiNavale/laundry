@@ -155,6 +155,17 @@ class LaundryTests(unittest.TestCase):
             self.assertEqual(deliver.call_args.args[0], 'dana-subscription')
             self.assertEqual(deliver.call_args.args[2]['deadline'], 17200)
 
+    def test_room_state_reports_if_the_reminder_worker_checked_recently(self):
+        def worker_active():
+            return self.c.get('/api/state', headers=self.a).json()['worker_active']
+
+        with patch.object(self.server.time, 'time', return_value=10000):
+            self.assertFalse(worker_active())
+            self.server.record_worker_check()
+            self.assertTrue(worker_active())
+        with patch.object(self.server.time, 'time', return_value=10121):
+            self.assertFalse(worker_active())
+
     def test_reminder_timing_and_yes_no(self):
         with patch.object(self.server.time, 'time', return_value=10000):
             self.start(minutes=1)
@@ -252,6 +263,27 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(self.c.get('/api/state', headers={
             **remembered, 'X-Room-Code': other,
         }).status_code, 403)
+
+    def test_mobile_cookie_restores_membership_and_device_after_local_storage_loss(self):
+        with TestClient(self.server.app, base_url='https://loop.test') as browser:
+            room = browser.post('/api/rooms', json={
+                'name': 'Recovery room', 'washers': 1, 'dryers': 0, 'passcode': 'recover me',
+            }).json()
+            headers = {'X-Room-Code': room['code'], 'X-Room-Token': room['token'], 'X-Client-Id': 'my-phone'}
+            self.assertEqual(browser.post('/api/machines/' + str(
+                browser.get('/api/state', headers=headers).json()['machines'][0]['id']
+            ) + '/start', headers=headers, json={'minutes': 4}).status_code, 200)
+            backup = browser.post('/api/room/saved', headers=headers)
+            self.assertEqual(backup.status_code, 200)
+            self.assertTrue(all('HttpOnly' in c and 'Secure' in c and 'Max-Age=' in c
+                                for c in backup.headers.get_list('set-cookie')))
+            restored = browser.get('/api/room/saved').json()
+            self.assertEqual(restored['last'], room['code'])
+            self.assertEqual(restored['client'], 'my-phone')
+            self.assertEqual(restored['rooms'][0]['token'], room['token'])
+            self.assertTrue(browser.get('/api/state', headers=headers).json()['machines'][0]['mine'])
+            self.assertEqual(browser.delete('/api/room/membership', headers=headers).status_code, 200)
+            self.assertEqual(browser.get('/api/room/saved').json()['rooms'], [])
 
     def test_leaving_revokes_the_token_and_clears_only_that_rooms_queue_spots(self):
         maple = self.c.post('/api/room/membership', headers={**self.b, 'X-Room-Code': 'MAPLE1'})

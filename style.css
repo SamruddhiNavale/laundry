@@ -79,3 +79,20 @@ aside { z-index: 3; }
 }
 
 .pickup-message { margin: 14px 0; line-height: 1.5; }
+
+.mobile-install {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid #dceaf3;
+  border-radius: 10px;
+  background: #edf5fa;
+  color: #365e7c;
+}
+.mobile-install p { margin-top: 4px; font-size: 12px; line-height: 1.5; }
+dialog ol { padding-left: 20px; line-height: 1.55; }
+dialog li + li { margin-top: 8px; }

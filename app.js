@@ -20,8 +20,10 @@ function roomRequest(url, options = {}) {
   });
 }
 
-const clientKey='loop-client-id';let client=localStorage.getItem(clientKey);if(!client){client=crypto.randomUUID();localStorage.setItem(clientKey,client)}
-let machines=[],filter='all',pushRegistered=false;const $=s=>document.querySelector(s);
+const clientKey = 'loop-client-id';
+const previousClient = localStorage.getItem(clientKey);
+let client = previousClient || crypto.randomUUID();
+let machines=[],filter='all',pushRegistered=false,workerActive=false;const $=s=>document.querySelector(s);
 function toast(message){const t=$('#toast');t.textContent=message;t.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.classList.remove('show'),4000)}
 async function refresh() {
   const version = roomVersion;
@@ -40,7 +42,10 @@ async function refresh() {
     const data = await res.json();
     if (version !== roomVersion) return false;
     machines = data.machines;
+    const alertsChanged = pushRegistered !== data.push_registered || workerActive !== Boolean(data.worker_active);
     pushRegistered = data.push_registered;
+    workerActive = Boolean(data.worker_active);
+    if (alertsChanged) updateAlerts();
     updateRoom(data.room);
     for (const m of machines) {
       const key = `loop-turn-${roomCode}-${m.id}`;
@@ -72,7 +77,11 @@ const alertsButton = $('#notifications');
 const registration = 'serviceWorker' in navigator
   ? navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).catch(() => null)
   : Promise.resolve(null);
-const supportsPush = 'PushManager' in window && 'Notification' in window && 'serviceWorker' in navigator;
+const isAppleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const installedMode = window.matchMedia('(display-mode: standalone)');
+const supportsPush = 'PushManager' in window && 'Notification' in window && 'serviceWorker' in navigator
+  && (!isAppleMobile || installedMode.matches || navigator.standalone === true);
 const alertsEnabled = () => localStorage.getItem('loop-alerts') !== 'off';
 
 function updateAlerts(status) {
@@ -83,7 +92,9 @@ function updateAlerts(status) {
   $('#notification-status').textContent = status || (!enabled ? 'Notifications are off on this device.'
     : !supportsPush ? 'To get mobile alerts, open Loop from your home screen on a browser that supports Web Push.'
     : Notification.permission === 'denied' ? 'Allow notifications in your device settings to receive alerts.'
-    : pushRegistered ? 'Pickup reminders can arrive while Loop is closed.'
+    : pushRegistered ? (workerActive
+      ? 'Pickup and queue-turn alerts can arrive while Loop is closed.'
+      : 'This device is set up. The server hasn’t checked for reminders recently.')
     : 'Tap Allow notifications to receive reminders while Loop is closed.');
 }
 
@@ -92,7 +103,8 @@ function syncAlerts() {
   alertSync = alertSync.catch(() => {}).then(async () => {
     if (!roomToken || !supportsPush) return;
     const worker = await registration;
-    if (!worker || !roomToken) return;
+    if (!roomToken) return;
+    if (!worker) throw Error('Couldn’t initialize device notifications. Reload Loop and try again.');
     let subscription = await worker.pushManager.getSubscription();
     if (!alertsEnabled() || Notification.permission !== 'granted') {
       if (subscription) await subscription.unsubscribe();
@@ -302,6 +314,8 @@ async function changeRoom(code, token) {
   if (!await refresh()) return false;
   localStorage.setItem('loop-token-' + code, token);
   localStorage.setItem('loop-room', code);
+  localStorage.setItem(clientKey, client);
+  roomRequest('/api/room/saved', {method: 'POST'}).catch(() => {});
   updateRoomPicker();
   $('#entry-screen').hidden = true;
   $('main').hidden = false;
@@ -477,6 +491,105 @@ $('#entry-create').onclick = () => setupRoom(true);
 $('#entry-join').onclick = () => showAccess(roomParam);
 $('#entry-return').onclick = returnToRoom;
 const startingRoom = roomParam || localStorage.getItem('loop-room');
-showEntry(roomParam ? 'You have a room invitation. Choose Join a room to continue.' : '');
-if (!params.has('home')) openRememberedRoom(startingRoom);
-let installPrompt=null;const installButton=document.createElement('button');installButton.className='install-button';installButton.textContent='Add Loop to your home screen';document.querySelector('.entry-card').append(installButton);window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e});installButton.onclick=async()=>{if(installPrompt){const prompt=installPrompt;installPrompt=null;await prompt.prompt();await prompt.userChoice}else{toast('Use your browser menu and choose “Add to Home Screen” or “Install app”. On iPhone, use Share → Add to Home Screen.')}};window.addEventListener('appinstalled',()=>{installButton.hidden=true});
+const inviteMessage = roomParam ? 'You have a room invitation. Choose Join a room to continue.' : '';
+showEntry(inviteMessage);
+
+async function initializeRoomAccess() {
+  if (!previousClient || !returnRoomCodes().length || (roomParam && !localStorage.getItem('loop-token-' + roomParam))) {
+    try {
+      const response = await nativeFetch('/api/room/saved', {cache: 'no-store'});
+      if (response.ok && !accessOpen && !roomToken) {
+        const saved = await response.json();
+        if (!accessOpen && !roomToken) {
+          if (!localStorage.getItem(clientKey) && /^[A-Za-z0-9-]{1,128}$/.test(saved.client || '')) {
+            client = saved.client;
+          }
+          for (const room of saved.rooms) {
+            if (!localStorage.getItem('loop-token-' + room.code)) {
+              localStorage.setItem('loop-token-' + room.code, room.token);
+              localStorage.setItem('loop-room-name-' + room.code, room.name);
+            }
+          }
+          if (saved.rooms.some(room => room.code === saved.last) && !localStorage.getItem('loop-room')) {
+            localStorage.setItem('loop-room', saved.last);
+          }
+          showEntry(inviteMessage);
+        }
+      }
+    } catch {
+      // Local saved access can still be used if the recovery request is unavailable.
+    }
+  }
+  if (!accessOpen && !roomToken && !params.has('home')) {
+    await openRememberedRoom(startingRoom || returnRoomCodes()[0]);
+  }
+}
+initializeRoomAccess();
+let installPrompt = null;
+let installedHere = false;
+const isMobile = isAppleMobile || /Android/.test(navigator.userAgent);
+const installButton = document.createElement('button');
+installButton.className = 'install-button';
+installButton.type = 'button';
+installButton.textContent = 'Add Loop to your home screen';
+$('.entry-card').append(installButton);
+
+function updateInstallControls() {
+  const installed = installedHere || installedMode.matches || navigator.standalone === true;
+  installButton.hidden = installed;
+  $('#mobile-install').hidden = installed || (!isMobile && !installPrompt);
+  $('#mobile-install-detail').textContent = isAppleMobile
+    ? 'Add Loop to your Home Screen, then open it from its icon and allow notifications.'
+    : 'Install Loop for quick access to your room and its notification settings.';
+}
+
+async function openInstall() {
+  if (installPrompt) {
+    const prompt = installPrompt;
+    installPrompt = null;
+    await prompt.prompt();
+    await prompt.userChoice;
+    updateInstallControls();
+    return;
+  }
+
+  const dialog = document.createElement('dialog');
+  dialog.innerHTML = '<form method="dialog"><h2>Add Loop to your Home Screen</h2><ol></ol>'
+    + '<label hidden>Room code<input readonly></label><button>Done</button></form>';
+  const steps = isAppleMobile
+    ? ['Open this page in Safari. Tap Share, then Add to Home Screen. Confirm by tapping Add.',
+       'Open Loop from its new icon. If your room isn’t shown, choose Join a room and use your room code and passcode.',
+       'Tap Allow device notifications and confirm the phone prompt.']
+    : ['Open the browser menu and choose Install app or Add to Home screen.',
+       'Open Loop and tap Allow device notifications.'];
+  dialog.querySelector('ol').append(...steps.map(step => {
+    const item = document.createElement('li');
+    item.textContent = step;
+    return item;
+  }));
+  const code = roomCode || roomParam;
+  if (isAppleMobile && code) {
+    dialog.querySelector('label').hidden = false;
+    const input = dialog.querySelector('input');
+    input.value = code;
+    input.addEventListener('focus', () => input.select());
+  }
+  document.body.append(dialog);
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.showModal();
+}
+
+installButton.onclick = openInstall;
+$('#dashboard-install').onclick = openInstall;
+window.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault();
+  installPrompt = event;
+  updateInstallControls();
+});
+window.addEventListener('appinstalled', () => {
+  installedHere = true;
+  installPrompt = null;
+  updateInstallControls();
+});
+installedMode.addEventListener('change', updateInstallControls);
+updateInstallControls();

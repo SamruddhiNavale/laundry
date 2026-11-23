@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import WebPushException, webpush
 from requests import Session
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -29,6 +29,10 @@ ROOT = Path(__file__).resolve().parent
 DB = os.environ.get('LAUNDRY_DB', str(ROOT / 'laundry.db'))
 DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL')
 TURN_SECONDS = 3600
+WORKER_STATUS_TTL = 120
+SAVED_ROOM_PATH = '/api/room/saved'
+SAVED_ROOM_AGE = 365 * 24 * 60 * 60
+ROOM_COOKIE_PREFIX = 'loop_room_'
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +41,7 @@ async def reminder_worker():
         try:
             await asyncio.to_thread(send_turn_alerts)
             await asyncio.to_thread(send_due_reminders)
+            await asyncio.to_thread(record_worker_check)
         except Exception:
             logger.exception('Laundry reminder worker failed')
         await asyncio.sleep(15)
@@ -143,6 +148,7 @@ def initialize():
 
 
 def initialize_access(db):
+    db.execute('CREATE TABLE IF NOT EXISTS reminder_worker_status (id INTEGER PRIMARY KEY, checked_at DOUBLE PRECISION NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS queue_turns (queue_id INTEGER PRIMARY KEY REFERENCES queue(id) ON DELETE CASCADE, deadline DOUBLE PRECISION NOT NULL, notified BOOLEAN NOT NULL DEFAULT FALSE)')
     db.execute('CREATE TABLE IF NOT EXISTS left_rooms (room TEXT NOT NULL REFERENCES rooms(code), client TEXT NOT NULL, PRIMARY KEY(room,client))')
     db.execute('CREATE TABLE IF NOT EXISTS room_memberships (token_hash TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(code))')
@@ -242,7 +248,7 @@ def remember_room(body: Optional[Passcode] = None, x_room_code: str = Header(),
 
 
 @app.delete('/api/room/membership')
-def leave_room(x_room_code: str = Header(), x_room_token: str = Header(),
+def leave_room(response: Response, x_room_code: str = Header(), x_room_token: str = Header(),
                x_client_id: str = Header()):
     client = client_id(x_client_id)
     with connect() as db:
@@ -255,7 +261,43 @@ def leave_room(x_room_code: str = Header(), x_room_token: str = Header(),
         offer_queue_turns(db, time.time())
         db.execute('INSERT INTO left_rooms(room,client) VALUES(?,?) ON CONFLICT DO NOTHING',
                    (code, client))
+    response.delete_cookie(ROOM_COOKIE_PREFIX + code, path=SAVED_ROOM_PATH, httponly=True)
     return {'ok': True}
+
+
+@app.post(SAVED_ROOM_PATH)
+def save_room_for_browser(request: Request, response: Response, x_room_code: str = Header(),
+                          x_room_token: str = Header(), x_client_id: str = Header()):
+    client = client_id(x_client_id)
+    with connect() as db:
+        code = get_room(db, x_room_code, None, x_room_token)['code']
+    settings = {
+        'max_age': SAVED_ROOM_AGE, 'path': SAVED_ROOM_PATH, 'httponly': True,
+        'secure': request.url.scheme == 'https' or bool(os.environ.get('VERCEL')), 'samesite': 'lax',
+    }
+    response.set_cookie(ROOM_COOKIE_PREFIX + code, x_room_token, **settings)
+    response.set_cookie('loop_last_room', code, **settings)
+    response.set_cookie('loop_device', client, **settings)
+    return {'ok': True}
+
+
+@app.get(SAVED_ROOM_PATH)
+def restore_saved_rooms(request: Request):
+    saved = []
+    cookies = request.cookies
+    with connect() as db:
+        for key, token in cookies.items():
+            if not key.startswith(ROOM_COOKIE_PREFIX) or not (0 < len(token) <= 128):
+                continue
+            code = key[len(ROOM_COOKIE_PREFIX):]
+            room = db.execute("""
+                SELECT r.code,r.name FROM room_memberships m JOIN rooms r ON r.code=m.room
+                WHERE m.token_hash=? AND r.code=?
+            """, (token_hash(token), code)).fetchone()
+            if room:
+                saved.append({**dict(room), 'token': token})
+    return {'rooms': saved, 'last': cookies.get('loop_last_room'),
+            'client': cookies.get('loop_device') if saved else None}
 
 
 def resize(db, code, washers, dryers):
@@ -355,6 +397,12 @@ def transition(db):
     offer_queue_turns(db, now)
 
 
+def record_worker_check():
+    with connect() as db:
+        db.execute('INSERT INTO reminder_worker_status(id,checked_at) VALUES(1,?) '
+                   'ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at', (time.time(),))
+
+
 @app.get('/api/state')
 def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None), x_room_token: Optional[str] = Header(default=None)):
     client = client_id(x_client_id)
@@ -378,8 +426,10 @@ def state(x_client_id: Optional[str] = Header(default=None), x_room_code: str = 
                 m['turn_deadline'] = queue[0]['deadline']
             machines.append(m)
         device = db.execute('SELECT 1 FROM push_devices WHERE client=?', (client,)).fetchone()
+        worker = db.execute('SELECT checked_at FROM reminder_worker_status WHERE id=1').fetchone()
         return {'machines': machines, 'room': {'code': room['code'], 'name': room['name']},
-                'push_registered': device is not None}
+                'push_registered': device is not None,
+                'worker_active': worker is not None and worker['checked_at'] >= time.time() - WORKER_STATUS_TTL}
 
 
 @app.post('/api/machines/{machine_id}/{action}')

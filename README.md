@@ -26,11 +26,19 @@ Open [Loop Laundry](http://127.0.0.1:8001/) in your browser. The local server is
 
 Access and laundry ownership are tied to the current browser profile. A different device, a private window, or clearing site data means joining again. Use separate browser profiles to simulate two residents. The one-hour window starts when a machine is released and the resident reaches the front of the queue.
 
+Loop also backs up saved room access in persistent cookies for the current site. On iOS and iPadOS 17.2 or later, installing Loop from the same browser can carry those cookies into a new Home Screen installation. Open your joined room in Safari before installing. If you open an invite from a different browser or an existing Home Screen installation that has never joined the room, you may need to join once there. Always use the same production domain.
+
 ## Mobile pickup reminders
 
 Mobile notifications require HTTPS. On iPhone and iPad, install Loop from Safari with **Add to Home Screen**, open the installed app, and tap **Allow device notifications**. Web Push requires iOS or iPadOS 16.4 or later. Loop defaults its notification setting to on, and the operating system asks for permission once. Use the top **Notifications** toggle to stop or resume reminders. Tapping a pickup notification opens the corresponding room and cycle.
 
 The regular FastAPI process checks for due reminders every 15 seconds. On Vercel, run `python server.py` on a persistent worker host with the same PostgreSQL connection as the web deployment. Store `LAUNDRY_PUSH_CONTACT` as the app's HTTPS URL or a `mailto:` contact. The push keys are generated and stored in the database. Keep them in backups so existing installations continue receiving reminders after a restore.
+
+### Turn on alerts for the live site
+
+1. Deploy this version to Vercel. On an always-on host, check out the same commit, install `requirements.txt`, and start a background process with `python server.py`. Use the host's secret settings to set `DATABASE_URL` to the same production database and branch that Vercel uses, and set `LAUNDRY_PUSH_CONTACT` to the production URL or your contact address. This worker needs outbound network access to PostgreSQL and browser push services.
+2. On your phone, use your production URL or an invite link. After joining, Loop shows an **Add to Home Screen** prompt with instructions for that device. Open Loop from its icon, join with the room code if needed, and tap **Allow device notifications**. In the reminders panel, Loop shows whether the device is registered and whether the worker recently checked for reminders.
+3. In a test room, start a one-minute timed load, close Loop, and wait for the pickup notification on the phone. For the queue alert, join the queue from a second browser, put that browser in the background, and release the completed machine from the first browser. Test with separate browser profiles or devices.
 
 ## Before making it public
 
