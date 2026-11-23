@@ -6,6 +6,7 @@ const nativeFetch = window.fetch.bind(window);
 let roomCode = '';
 let roomToken = '';
 let roomVersion = 0;
+let roomAccessRejected = false;
 
 function roomRequest(url, options = {}) {
   return nativeFetch(url, {
@@ -28,9 +29,11 @@ async function refresh() {
     const res = await roomRequest('/api/state', {cache: 'no-store'});
     if (version !== roomVersion) return false;
     if (res.status === 403) {
-      localStorage.removeItem('loop-token-' + roomCode);
+      // A deployment can temporarily point at a database that doesn't recognize this token.
+      roomAccessRejected = true;
+      roomVersion++;
       roomToken = '';
-      showEntry('Saved access to this room is no longer available.');
+      showEntry('This room is currently unavailable. You can retry with your saved access.');
       return false;
     }
     if (!res.ok) throw Error('Unable to load machine status');
@@ -298,6 +301,7 @@ async function changeRoom(code, token) {
   roomVersion++;
   roomCode = code;
   roomToken = token;
+  roomAccessRejected = false;
   machines = [];
   history.replaceState(null, '', location.pathname);
   if (!await refresh()) return false;
@@ -385,7 +389,8 @@ async function showAccess(knownCode = '') {
       code = selected.code.trim().toUpperCase();
       if (!code) return;
     }
-    if (await openRememberedRoom(code) || localStorage.getItem('loop-token-' + code)) return;
+    if (await openRememberedRoom(code)) return;
+    if (localStorage.getItem('loop-token-' + code) && !roomAccessRejected) return;
     const login = await formDialog(`Join room ${code}`, [{name: 'passcode', label: 'Room passcode', type: 'password'}]);
     if (login) await changeRoom(code, await rememberRoom(code, login.passcode));
   } catch (error) {
@@ -457,14 +462,17 @@ async function returnToRoom() {
   const button = $('#entry-return');
   button.disabled = true;
   try {
-    for (const code of returnRoomCodes()) {
+    const codes = returnRoomCodes();
+    for (const code of codes) {
       if (await openRememberedRoom(code)) return;
-      if (localStorage.getItem('loop-token-' + code)) {
+      if (localStorage.getItem('loop-token-' + code) && !roomAccessRejected) {
         showEntry('Couldn’t open your saved room. Try again.');
         return;
       }
     }
-    showEntry('There’s no saved room access on this browser.');
+    showEntry(codes.length
+      ? 'Your saved rooms are currently unavailable. You can try again.'
+      : 'There’s no saved room access on this browser.');
   } finally {
     accessOpen = false;
     button.disabled = returnRoomCodes().length === 0;

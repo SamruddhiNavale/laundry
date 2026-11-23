@@ -47,3 +47,9 @@ This version is suitable for local testing and a restricted pilot. The room pass
 ```sh
 .venv/bin/python -m unittest discover -v
 ```
+
+### Check room access after a Vercel deployment
+
+Keep the Production deployment connected to the same PostgreSQL database and schema across releases. App startup creates missing tables and leaves existing data in place. A different database or database branch can make rooms appear missing. Keep residents on the same production URL so their browser can reuse saved room access.
+
+For a release smoke test, open an existing test room on the production URL before deploying. After deploying, reload the same URL in the same browser profile and use **Return to my room**. Confirm the room opens without a passcode and still shows its machines and any test queue positions. A preview or deployment-specific hostname has its own browser storage. Use staging for simulated database changes. If saved rooms become unavailable immediately after a release, verify the production database connection before asking residents to join again.
