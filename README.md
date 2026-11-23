@@ -1,10 +1,10 @@
 # Loop Laundry
 
-A local shared laundry prototype with a FastAPI backend, SQLite database, and a plain HTML/CSS/JavaScript frontend. Machine status, cycle times, and FIFO queues are shared between browsers connected to the same server. Each browser receives a locally stored demo identity. The server tracks cycle completion and sends pickup reminders through Web Push. Tap a reminder to open the pickup prompt.
+Loop helps residents share washers and dryers. Each room has its own machines and first-in, first-out queues. The app uses FastAPI, SQLite or PostgreSQL, and a browser frontend that can be installed on a phone's home screen.
 
-## Run
+## Run locally
 
-Python 3.15 is the current recommended target. Python 3.9 is supported for this local environment, but installs an older compatible FastAPI version. Create a virtual environment, install dependencies, and start the server:
+Use Python 3.13 to match the container, or a compatible Python version.
 
 ```sh
 python3 -m venv .venv
@@ -12,31 +12,38 @@ python3 -m venv .venv
 .venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8001
 ```
 
-Open http://127.0.0.1:8001. API documentation is available at http://127.0.0.1:8001/docs. Data persists in `laundry.db`; set `LAUNDRY_DB` to use a different database file.
+Open [Loop Laundry](http://127.0.0.1:8001/) in your browser. The local server is reachable only from this computer. Data persists in `laundry.db` unless you set `LAUNDRY_DB`.
 
+## Resident flow
 
-## Rooms and invitations
+1. **Create a room** with a unique name, machine counts, and a passcode of 6–128 characters. Spaces and Unicode are accepted. A name that differs only in capitalization or surrounding spaces is already taken.
+2. Open **Invite residents** to copy the room link or code. Share the passcode separately. Residents can follow the invite or choose **Join a room** and type the code.
+3. Use the top-left Loop icon to go home. **Return to my room** opens the last room with saved access on that browser. The arrow beside the current room opens the saved-room menu. On smaller screens it sits in the header. Use **Leave room** to remove saved access, queue spots, and future reminders for that room on this device.
+4. On a free machine, choose **Start a load** and enter the duration. On a busy machine, choose **Join queue**. The first resident in line can start once the previous load is picked up. Queue-turn alerts appear while the room is open.
+5. At pickup, choose **Clothes picked up** to release the machine, or **No, still there** in the reminder to defer it for an hour. If someone has already removed their clothes and forgotten to confirm, check that the drum is empty and use **Force stop** on the completed cycle. The existing queue keeps its order.
 
-Use Create room to set a name and washer/dryer counts. Edit room changes those counts; machines with active loads or queues cannot be removed. Invite residents displays the room code and link, and Join room accepts a code. Rooms have separate machines and queues. The local server binds to 127.0.0.1, so its invite links only work on this computer; sharing with other devices requires a reachable hosted server. Do not use this prototype for real residents without accounts, access controls, and secure hosting.
+**Edit room** changes the room name and machine counts. Machines in use or with a queue must be released before you reduce the count. **Change room passcode** requires the current passcode. New joins use the updated passcode, while previously joined browsers retain access.
 
-Run the backend checks with `.venv/bin/python -m unittest -v test_server`.
+Access and laundry ownership are tied to the current browser profile. A different device, a private window, or clearing site data means joining again. Use separate browser profiles to simulate two residents. A first-in-line reservation currently lasts until that resident starts a load or leaves the queue.
 
-Rooms created now require a separate passcode (6–128 printable ASCII characters, no spaces). Share the invite code or link and communicate the passcode separately. After a successful join, the browser saves a room access token. The server stores hashes of passcodes and tokens. Previously joined devices may need to enter the passcode once after upgrading if their old browser session has already ended. Previously created rooms have no passcode: on this local prototype, select **Set up existing room** and set one once using the room code. This migration is first-come, so do it only on a trusted local server before sharing access. Anyone with a room passcode can edit the room; individual accounts, rate limiting, TLS, and administrator roles are still needed before public deployment.
+## Mobile pickup reminders
 
-The app does not ask for a name or create a profile. It uses a random identifier stored in the browser to recognize that browser's loads and queue positions. Clearing browser storage or switching browsers loses that association; the identifier is pseudonymous rather than a guarantee of anonymity.
+Mobile notifications require HTTPS. On iPhone and iPad, install Loop from Safari with **Add to Home Screen**, open the installed app, and tap **Allow device notifications**. Web Push requires iOS or iPadOS 16.4 or later. Loop defaults its notification setting to on, and the operating system asks for permission once. Use the top **Notifications** toggle to stop or resume reminders. Tapping a pickup notification opens the corresponding room and cycle.
 
-The anonymous identifier is shared by tabs in the same browser profile, so they act as the same resident. Separate residents should use separate browser profiles or devices. The browser that started a load can end it and confirm pickup. A room member can use **Force stop** to release someone else’s completed cycle after checking that the drum is empty. The first person in the FIFO queue keeps their spot and receives an alert while the page is open. A reserved machine also accepts additional people into the queue. Reservations currently do not expire.
+The regular FastAPI process checks for due reminders every 15 seconds. On Vercel, run `python server.py` on a persistent worker host with the same PostgreSQL connection as the web deployment. Store `LAUNDRY_PUSH_CONTACT` as the app's HTTPS URL or a `mailto:` contact. The push keys are generated and stored in the database. Keep them in backups so existing installations continue receiving reminders after a restore.
 
-## Mobile pickup notifications
+## Before making it public
 
-Serve Loop over HTTPS for mobile Web Push. On iPhone and iPad, open Loop using the installed Home Screen icon (iOS/iPadOS 16.4 or later). Notifications are on by default in Loop. Tap **Allow device notifications** once to grant your device’s permission. Use the top **Notifications** toggle to turn reminders off or back on. When a completed load is still waiting for pickup, reminders repeat hourly.
+This version is suitable for local testing and a restricted pilot. The room passcode grants membership and room-edit access. There are no individual accounts, owner roles, or per-member administrator controls. Changing a passcode stops new joins with the old passcode. Revoking a former resident's saved access requires a management feature that this version does not have.
 
-The normal FastAPI server runs the reminder worker automatically. On Vercel, run `python server.py` as a persistent worker on a separate host with the same Postgres connection as the web app. The worker checks for due reminders every 15 seconds. Push keys are generated and persisted in the shared database. Set `LAUNDRY_PUSH_CONTACT` to your HTTPS site URL or a `mailto:` contact address.
+- Add individual authentication, room-level roles, and member revocation before exposing shared-room management to the public. Device IDs currently identify loads and queue positions within the prototype.
+- Apply request limits at the hosting edge, especially to room creation, room joins, and passcode changes. Keep TLS enabled and omit passcodes, room tokens, and push subscription data from request logs.
+- Set `DATABASE_URL` or `POSTGRES_URL` for hosted PostgreSQL. A newly configured hosted database starts empty. Plan any import of local SQLite data separately. For a single persistent container, mount a writable data volume at `/data`. Keep database credentials in the host's secret settings and test restoring a backup.
+- Keep `LAUNDRY_ENABLE_LEGACY_SETUP` unset on any reachable deployment. For an old room with no passcode, enable it temporarily on an isolated loopback server and call `POST /api/rooms/{code}/set-initial-passcode` with a JSON `passcode` field. Disable it again before exposing the server.
+- In staging, verify the same flow with two separate browser profiles, a hosted PostgreSQL database, and a phone with the app closed. Check queue order after pickup and Force stop, saved-room switching, passcode rotation, and notification opt-out. Local tests exercise SQLite and mock push delivery. They do not connect to a hosted PostgreSQL service or deliver a real phone notification.
 
-## Container preparation
+## Tests
 
-A Dockerfile is included for a Python-compatible host. It runs as a non-root user and expects a persistent, writable volume mounted at `/data`; SQLite data is not included in the image. Before public deployment, replace the prototype's impersonable browser identity, add rate limiting and access controls, provide HTTPS and backups, and review the one-time legacy-room passcode setup. A container alone does not make this app production-ready.
-
-## Hosted Postgres preparation
-
-The backend supports a PostgreSQL connection in `DATABASE_URL` or `POSTGRES_URL`, and continues to use SQLite locally when neither is set. On Vercel one of these variables must be configured; credentials should only be set in the hosting provider's secret settings. A new hosted database starts empty; local SQLite records are not transferred automatically. The existing prototype security limitations still apply, and this adapter has not yet been verified against a live PostgreSQL service.
+```sh
+.venv/bin/python -m unittest discover -v
+```

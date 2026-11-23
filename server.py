@@ -10,6 +10,7 @@ import hmac
 import secrets
 import sqlite3
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -20,8 +21,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import WebPushException, webpush
 from requests import Session
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field, field_validator
 
 ROOT = Path(__file__).resolve().parent
 DB = os.environ.get('LAUNDRY_DB', str(ROOT / 'laundry.db'))
@@ -53,6 +55,23 @@ async def lifespan(app):
 
 
 app = FastAPI(title='Loop Laundry API', lifespan=lifespan)
+
+
+@app.middleware('http')
+async def response_headers(request, call_next):
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'same-origin'
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    # Keep credential inputs and request bodies out of validation responses.
+    errors = [{key: error[key] for key in ('loc', 'msg', 'type')} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={'detail': errors})
 
 
 class PostgresConnection:
@@ -122,6 +141,7 @@ def initialize():
 
 
 def initialize_access(db):
+    db.execute('CREATE TABLE IF NOT EXISTS left_rooms (room TEXT NOT NULL REFERENCES rooms(code), client TEXT NOT NULL, PRIMARY KEY(room,client))')
     db.execute('CREATE TABLE IF NOT EXISTS room_memberships (token_hash TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(code))')
     db.execute('CREATE TABLE IF NOT EXISTS push_devices (client TEXT PRIMARY KEY, subscription TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS push_keys (id INTEGER PRIMARY KEY, private_key TEXT NOT NULL, public_key TEXT NOT NULL)')
@@ -138,11 +158,34 @@ class RoomSetup(BaseModel):
     washers: int = Field(ge=0, le=50, strict=True)
     dryers: int = Field(ge=0, le=50, strict=True)
 
-class CreateRoom(RoomSetup):
-    passcode: str = Field(min_length=6, max_length=128, pattern=r'^[\x21-\x7e]+$')
+    @field_validator('name', mode='before')
+    @classmethod
+    def clean_name(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            if any(unicodedata.category(char) in ('Cc', 'Cs') for char in value):
+                raise HTTPException(422, 'Room names must use visible characters.')
+        return value
 
 class Passcode(BaseModel):
-    passcode: str = Field(min_length=6, max_length=128, pattern=r'^[\x21-\x7e]+$')
+    passcode: str
+
+    @field_validator('passcode')
+    @classmethod
+    def validate_passcode(cls, value):
+        if not 6 <= len(value) <= 128 or not value.strip():
+            raise HTTPException(422, 'Use a passcode with 6–128 characters and at least one non-space character.')
+        if any(unicodedata.category(char) in ('Cc', 'Cs') for char in value):
+            raise HTTPException(422, 'The passcode contains an unsupported character.')
+        return value
+
+
+class CreateRoom(RoomSetup, Passcode):
+    pass
+
+
+class ChangePasscode(Passcode):
+    current_passcode: str
 
 def hash_passcode(passcode):
     salt = secrets.token_hex(16)
@@ -152,11 +195,22 @@ def hash_passcode(passcode):
 def verify_passcode(passcode, stored):
     if not passcode or not stored or len(passcode) > 128: return False
     salt, expected = stored.split(':')
-    actual = hashlib.pbkdf2_hmac('sha256', passcode.encode(), bytes.fromhex(salt), 260000).hex()
+    try:
+        encoded = passcode.encode()
+    except UnicodeEncodeError:
+        return False
+    actual = hashlib.pbkdf2_hmac('sha256', encoded, bytes.fromhex(salt), 260000).hex()
     return hmac.compare_digest(actual, expected)
 
 def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def issue_room_token(db, code):
+    token = secrets.token_urlsafe(32)
+    db.execute('INSERT INTO room_memberships(token_hash,room) VALUES(?,?)',
+               (token_hash(token), code))
+    return token
 
 
 def get_room(db, code, passcode, token=None):
@@ -171,13 +225,33 @@ def get_room(db, code, passcode, token=None):
 
 
 @app.post('/api/room/membership')
-def remember_room(x_room_code: str = Header(), x_room_passcode: str = Header()):
+def remember_room(body: Optional[Passcode] = None, x_room_code: str = Header(),
+                  x_room_passcode: Optional[str] = Header(default=None),
+                  x_client_id: Optional[str] = Header(default=None)):
     with connect() as db:
-        room = get_room(db, x_room_code, x_room_passcode)
-        token = secrets.token_urlsafe(32)
-        db.execute('INSERT INTO room_memberships(token_hash,room) VALUES(?,?)',
-                   (token_hash(token), room['code']))
+        db.execute('BEGIN IMMEDIATE')
+        room = get_room(db, x_room_code, body.passcode if body else x_room_passcode)
+        token = issue_room_token(db, room['code'])
+        if x_client_id:
+            db.execute('DELETE FROM left_rooms WHERE room=? AND client=?',
+                       (room['code'], client_id(x_client_id)))
     return {'token': token}
+
+
+@app.delete('/api/room/membership')
+def leave_room(x_room_code: str = Header(), x_room_token: str = Header(),
+               x_client_id: str = Header()):
+    client = client_id(x_client_id)
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        code = get_room(db, x_room_code, None, x_room_token)['code']
+        db.execute('DELETE FROM room_memberships WHERE token_hash=? AND room=?',
+                   (token_hash(x_room_token), code))
+        db.execute('DELETE FROM queue WHERE client=? AND machine_id IN (SELECT id FROM machines WHERE room=?)',
+                   (client, code))
+        db.execute('INSERT INTO left_rooms(room,client) VALUES(?,?) ON CONFLICT DO NOTHING',
+                   (code, client))
+    return {'ok': True}
 
 
 def resize(db, code, washers, dryers):
@@ -194,7 +268,8 @@ def resize(db, code, washers, dryers):
 
 @app.post('/api/rooms/{code}/set-initial-passcode')
 def set_initial_passcode(code: str, body: Passcode):
-    # Only pre-existing rooms without a passcode can use this one-time migration.
+    if os.environ.get('LAUNDRY_ENABLE_LEGACY_SETUP') != '1':
+        raise HTTPException(404, 'Not found')
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT passcode_hash FROM rooms WHERE code=?', (code.upper(),)).fetchone()
@@ -205,26 +280,52 @@ def set_initial_passcode(code: str, body: Passcode):
 
 @app.post('/api/rooms')
 def create_room(body: CreateRoom):
-    name = body.name.strip()
-    if not name: raise HTTPException(422, 'Room name is required')
+    name = body.name
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
+        require_unique_room_name(db, name)
         code = secrets.token_hex(4).upper()
         while db.execute('SELECT 1 FROM rooms WHERE code=?', (code,)).fetchone(): code = secrets.token_hex(4).upper()
         db.execute('INSERT INTO rooms(code,name,passcode_hash) VALUES(?,?,?)', (code,name,hash_passcode(body.passcode)))
         resize(db, code, body.washers, body.dryers)
-    return {'code': code, 'name': name}
+        token = issue_room_token(db, code)
+    return {'code': code, 'name': name, 'token': token}
+
+
+def room_name_key(name):
+    return unicodedata.normalize('NFC', name.strip().casefold())
+
+
+def require_unique_room_name(db, name, current_room=None):
+    name_key = room_name_key(name)
+    for room in db.execute('SELECT code, name FROM rooms'):
+        if room['code'] != current_room and room_name_key(room['name']) == name_key:
+            raise HTTPException(409, 'A room with this name already exists. Choose a different room name.')
+
 
 @app.put('/api/room')
 def edit_room(body: RoomSetup, x_room_code: str = Header(default='MAPLE1'), x_room_passcode: Optional[str] = Header(default=None), x_room_token: Optional[str] = Header(default=None)):
-    name = body.name.strip()
-    if not name: raise HTTPException(422, 'Room name is required')
+    name = body.name
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         room = get_room(db, x_room_code, x_room_passcode, x_room_token)
+        if room_name_key(name) != room_name_key(room['name']):
+            require_unique_room_name(db, name, room['code'])
         transition(db)
         resize(db, room['code'], body.washers, body.dryers)
         db.execute('UPDATE rooms SET name=? WHERE code=?', (name,room['code']))
+    return {'ok': True}
+
+
+@app.put('/api/room/passcode')
+def change_passcode(body: ChangePasscode, x_room_code: str = Header(), x_room_token: str = Header()):
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        room = get_room(db, x_room_code, None, x_room_token)
+        if not verify_passcode(body.current_passcode, room['passcode_hash']):
+            raise HTTPException(403, 'The current room passcode is incorrect.')
+        db.execute('UPDATE rooms SET passcode_hash=? WHERE code=?',
+                   (hash_passcode(body.passcode), room['code']))
     return {'ok': True}
 
 
@@ -377,6 +478,7 @@ def send_due_reminders():
             SELECT m.id, m.name, m.room, m.owner, m.end, p.subscription
             FROM machines m JOIN push_devices p ON p.client=m.owner
             WHERE m.state='done' AND (m.next_reminder IS NULL OR m.next_reminder<=?)
+              AND NOT EXISTS (SELECT 1 FROM left_rooms l WHERE l.room=m.room AND l.client=m.owner)
             ORDER BY m.next_reminder LIMIT 20
         """, (now,)))
         if not pending:
@@ -392,6 +494,7 @@ def send_due_reminders():
             current = db.execute("""
                 SELECT 1 FROM machines m JOIN push_devices p ON m.owner=p.client
                 WHERE m.id=? AND m.state='done' AND m.next_reminder=? AND p.subscription=?
+                  AND NOT EXISTS (SELECT 1 FROM left_rooms l WHERE l.room=m.room AND l.client=m.owner)
             """, (m['id'], now+180, m['subscription'])).fetchone()
         if not current:
             continue
@@ -426,7 +529,15 @@ def send_due_reminders():
 
 
 @app.get('/')
-def index(): return FileResponse(ROOT / 'index.html')
+def index():
+    return FileResponse(ROOT / 'index.html', headers={
+        'Cache-Control': 'no-cache',
+        'Content-Security-Policy': (
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        ),
+    })
 
 @app.get('/{asset}')
 def asset(asset: str):
