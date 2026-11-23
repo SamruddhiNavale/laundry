@@ -19,11 +19,15 @@ class LaundryTests(unittest.TestCase):
         import server
         self.server = importlib.reload(server)
         self.c = TestClient(self.server.app)
-        with patch.dict(os.environ, {'LAUNDRY_ENABLE_LEGACY_SETUP': '1'}):
-            self.c.post('/api/rooms/MAPLE1/set-initial-passcode', json={'passcode': 'maple123'})
-        self.a = {'X-Client-Id': 'alice', 'X-Room-Passcode': 'maple123'}
-        self.b = {'X-Client-Id': 'bob', 'X-Room-Passcode': 'maple123'}
-        self.d = {'X-Client-Id': 'dana', 'X-Room-Passcode': 'maple123'}
+        self.a = self.join('alice')
+        self.b = self.join('bob')
+        self.d = self.join('dana')
+
+    def join(self, client, code='MAPLE1'):
+        headers = {'X-Client-Id': client, 'X-Room-Code': code}
+        joined = self.c.post('/api/room/membership', headers=headers)
+        self.assertEqual(joined.status_code, 200)
+        return {**headers, 'X-Room-Token': joined.json()['token']}
 
     def tearDown(self):
         self.c.close()
@@ -50,20 +54,17 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(self.c.get('/laundry.db').status_code, 404)
 
     def test_default_safeguards_and_private_validation_errors(self):
-        with patch.dict(os.environ, {'LAUNDRY_ENABLE_LEGACY_SETUP': '0'}):
-            self.assertEqual(self.c.post('/api/rooms/MAPLE1/set-initial-passcode', json={
-                'passcode': 'anything',
-            }).status_code, 404)
+        self.assertEqual(self.c.post('/api/rooms/MAPLE1/set-initial-passcode').status_code, 404)
+        self.assertEqual(self.c.put('/api/room/passcode').status_code, 404)
         page = self.c.get('/')
         self.assertIn("script-src 'self'", page.headers['Content-Security-Policy'])
         self.assertIn("frame-ancestors 'none'", page.headers['Content-Security-Policy'])
         self.assertEqual(page.headers['X-Content-Type-Options'], 'nosniff')
-        invalid = self.c.put('/api/room/passcode', headers={
-            'X-Room-Code': 'MAPLE1', 'X-Room-Token': 'fake-token',
-        }, json={'current_passcode': 'test-current-private', 'passcode': {'value': 'test-new-private'}})
+        invalid = self.c.put('/api/room', headers=self.a, json={
+            'name': {'value': 'private-validation-input'}, 'washers': 1, 'dryers': 1,
+        })
         self.assertEqual(invalid.status_code, 422)
-        self.assertNotIn('test-current-private', invalid.text)
-        self.assertNotIn('test-new-private', invalid.text)
+        self.assertNotIn('private-validation-input', invalid.text)
         self.assertEqual(invalid.headers['Cache-Control'], 'no-store')
 
     def test_stale_owner_action_cannot_change_a_later_cycle(self):
@@ -190,19 +191,17 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(sorted(results), [200, 409])
 
     def test_rooms_and_resize(self):
-        data = {'name': 'Oak House', 'washers': 2, 'dryers': 1, 'passcode': 'oakpass'}
+        data = {'name': 'Oak House', 'washers': 2, 'dryers': 1}
         created = self.c.post('/api/rooms', json=data)
         self.assertEqual(created.status_code, 200)
         code = created.json()['code']
-        headers = {**self.a, 'X-Room-Code': code, 'X-Room-Passcode': 'oakpass'}
+        headers = {**self.a, 'X-Room-Code': code, 'X-Room-Token': created.json()['token']}
         room = self.c.get('/api/state', headers=headers).json()
         self.assertEqual(room['room']['name'], 'Oak House')
         self.assertEqual(len(room['machines']), 3)
         self.assertEqual(self.c.get('/api/state', headers={**self.a, 'X-Room-Code': 'NOPE'}).status_code, 403)
-        self.assertEqual(self.c.get('/api/state', headers={**headers, 'X-Room-Passcode': 'wrong'}).status_code, 403)
-        self.assertNotIn('passcode_hash', room['room'])
-        with patch.dict(os.environ, {'LAUNDRY_ENABLE_LEGACY_SETUP': '1'}):
-            self.assertEqual(self.c.post(f'/api/rooms/{code}/set-initial-passcode', json={'passcode': 'hijack'}).status_code, 409)
+        self.assertEqual(self.c.get('/api/state', headers={**headers, 'X-Room-Token': 'wrong'}).status_code, 403)
+        self.assertEqual(set(room['room']), {'code', 'name'})
         machine_id = room['machines'][1]['id']
         self.assertEqual(self.c.post(f'/api/machines/{machine_id}/start', headers=headers, json={'minutes': 5}).status_code, 200)
         self.assertEqual(self.c.post(f'/api/machines/{machine_id}/finish', headers=self.a).status_code, 404)
@@ -211,12 +210,11 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(len(self.c.get('/api/state', headers=headers).json()['machines']), 3)
         self.assertEqual(len(self.c.get('/api/state', headers=self.a).json()['machines']), 6)
 
-    def test_passcode_required_for_all_room_operations(self):
-        for headers in ({'X-Client-Id': 'alice'}, {'X-Client-Id': 'alice', 'X-Room-Passcode': 'wrong'}):
+    def test_membership_token_required_for_all_room_operations(self):
+        for headers in ({'X-Client-Id': 'alice'}, {'X-Client-Id': 'alice', 'X-Room-Token': 'wrong'}):
             self.assertEqual(self.c.get('/api/state', headers=headers).status_code, 403)
             self.assertEqual(self.c.post('/api/machines/1/start', headers=headers, json={'minutes': 1}).status_code, 403)
             self.assertEqual(self.c.put('/api/room', headers=headers, json={'name': 'test', 'washers': 1, 'dryers': 1}).status_code, 403)
-        self.assertEqual(self.c.post('/api/rooms', json={'name': 'test', 'washers': 1, 'dryers': 1, 'passcode': 'short'}).status_code, 422)
 
     def test_each_machine_and_boundary_durations(self):
         for machine in range(1, 7):
@@ -258,7 +256,7 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(self.c.get('/api/state', headers=remembered).status_code, 200)
         self.assertEqual(self.start(remembered).status_code, 200)
         other = self.c.post('/api/rooms', json={
-            'name': 'Other house', 'washers': 1, 'dryers': 0, 'passcode': 'different123',
+            'name': 'Other house', 'washers': 1, 'dryers': 0,
         }).json()['code']
         self.assertEqual(self.c.get('/api/state', headers={
             **remembered, 'X-Room-Code': other,
@@ -267,7 +265,7 @@ class LaundryTests(unittest.TestCase):
     def test_mobile_cookie_restores_membership_and_device_after_local_storage_loss(self):
         with TestClient(self.server.app, base_url='https://loop.test') as browser:
             room = browser.post('/api/rooms', json={
-                'name': 'Recovery room', 'washers': 1, 'dryers': 0, 'passcode': 'recover me',
+                'name': 'Recovery room', 'washers': 1, 'dryers': 0,
             }).json()
             headers = {'X-Room-Code': room['code'], 'X-Room-Token': room['token'], 'X-Client-Id': 'my-phone'}
             self.assertEqual(browser.post('/api/machines/' + str(
@@ -288,7 +286,7 @@ class LaundryTests(unittest.TestCase):
     def test_leaving_revokes_the_token_and_clears_only_that_rooms_queue_spots(self):
         maple = self.c.post('/api/room/membership', headers={**self.b, 'X-Room-Code': 'MAPLE1'})
         other = self.c.post('/api/rooms', json={
-            'name': 'Other house', 'washers': 1, 'dryers': 0, 'passcode': 'different123',
+            'name': 'Other house', 'washers': 1, 'dryers': 0,
         }).json()
         maple_access = {'X-Room-Code': 'MAPLE1', 'X-Client-Id': 'bob', 'X-Room-Token': maple.json()['token']}
         other_access = {'X-Room-Code': other['code'], 'X-Room-Token': other['token'], 'X-Client-Id': 'bob'}
@@ -304,7 +302,7 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(other_state['queue_position'], 1)
         joined_again = self.c.post('/api/room/membership', headers={
             'X-Room-Code': 'MAPLE1', 'X-Client-Id': 'bob',
-        }, json={'passcode': 'maple123'})
+        })
         self.assertEqual(joined_again.status_code, 200)
         self.assertEqual(self.c.get('/api/state', headers={
             **maple_access, 'X-Room-Token': joined_again.json()['token'],
@@ -312,62 +310,35 @@ class LaundryTests(unittest.TestCase):
         with self.server.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM left_rooms WHERE client=?', ('bob',)).fetchone())
 
-    def test_create_and_join_passcode_combinations(self):
-        valid = ('abc123', 'two words', ' leading and trailing ', 'été 🔑 123', 'a' * 128)
-        invalid = ('short', 'a' * 129, ' ' * 8, 'abc\n123', 'abc\x00123')
-        for index, passcode in enumerate(valid + invalid):
-            with self.subTest(index=index):
-                body = {'name': f'Room {index}', 'washers': 0, 'dryers': 1, 'passcode': passcode}
-                created = self.c.post('/api/rooms', json=body)
-                if passcode in invalid:
-                    self.assertEqual(created.status_code, 422)
-                    self.assertIsInstance(created.json()['detail'], str)
-                    continue
-                self.assertEqual(created.status_code, 200)
-                code = created.json()['code']
-                room = {'X-Room-Code': code}
-                creator = self.c.get('/api/state', headers={
-                    **room, 'X-Room-Token': created.json()['token'], 'X-Client-Id': 'creator',
-                })
-                self.assertEqual(creator.status_code, 200)
-                joined = self.c.post('/api/room/membership', headers=room, json={'passcode': passcode})
-                self.assertEqual(joined.status_code, 200)
-                wrong = self.c.post('/api/room/membership', headers=room, json={'passcode': 'wrong one'})
-                self.assertEqual(wrong.status_code, 403)
-                state = self.c.get('/api/state', headers={
-                    **room, 'X-Room-Token': joined.json()['token'], 'X-Client-Id': 'alice',
-                })
-                self.assertEqual(state.status_code, 200)
-                self.assertEqual([machine['type'] for machine in state.json()['machines']], ['dryer'])
+    def test_create_and_join_with_room_code_only(self):
+        created = self.c.post('/api/rooms', json={'name': 'Room', 'washers': 0, 'dryers': 1})
+        self.assertEqual(created.status_code, 200)
+        room = created.json()
+        self.assertRegex(room['code'], r'^[A-F0-9]{16}$')
+        self.assertEqual(self.c.post('/api/room/membership', headers={'X-Room-Code': 'unknown'}).status_code, 404)
+        self.assertEqual(self.c.post('/api/room/membership', headers={'X-Room-Code': 'invalid!'}).status_code, 422)
+        joined = self.join('visitor', room['code'].lower())
+        state = self.c.get('/api/state', headers=joined).json()
+        self.assertEqual([machine['type'] for machine in state['machines']], ['dryer'])
 
-    def test_change_room_passcode_preserves_memberships_and_requires_current_passcode(self):
-        room = {'X-Room-Code': 'MAPLE1'}
-        token = self.c.post('/api/room/membership', headers=room, json={'passcode': 'maple123'}).json()['token']
-        headers = {**room, 'X-Room-Token': token}
-        change = {'current_passcode': 'maple123', 'passcode': 'new 🔑 code'}
-        self.assertEqual(self.c.put('/api/room/passcode', headers={
-            **room, 'X-Room-Token': 'invalid',
-        }, json=change).status_code, 403)
-        self.assertEqual(self.c.put('/api/room/passcode', headers=headers, json={
-            **change, 'current_passcode': 'incorrect',
-        }).status_code, 403)
-        self.assertEqual(self.c.put('/api/room/passcode', headers=headers, json={
-            **change, 'passcode': 'short',
-        }).status_code, 422)
-        self.assertEqual(self.c.put('/api/room/passcode', headers=headers, json=change).status_code, 200)
-        self.assertEqual(self.c.post('/api/room/membership', headers=room, json={'passcode': 'maple123'}).status_code, 403)
-        self.assertEqual(self.c.post('/api/room/membership', headers=room, json={'passcode': change['passcode']}).status_code, 200)
-        self.assertEqual(self.c.get('/api/state', headers={**headers, 'X-Client-Id': 'alice'}).status_code, 200)
+    def test_existing_rooms_and_tokens_survive_passcode_removal(self):
+        with self.server.connect() as db:
+            db.execute('ALTER TABLE rooms ADD COLUMN passcode_hash TEXT')
+            db.execute("UPDATE rooms SET passcode_hash='legacy-value' WHERE code='MAPLE1'")
+        self.start()
+        self.server.initialize()
+        self.assertTrue(self.state()['mine'])
+        self.assertEqual(self.c.get('/api/state', headers=self.join('new-resident')).status_code, 200)
 
     def test_room_name_duplicates_on_create_and_rename(self):
         body = {'name': '  Café House  ', 'washers': 1, 'dryers': 0}
-        first = self.c.post('/api/rooms', json={**body, 'passcode': 'coffee shop'})
+        first = self.c.post('/api/rooms', json={**body})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()['name'], 'Café House')
         for name in ('Café House', 'CAFÉ HOUSE', 'cafe\u0301 house ', ' maple1 ', ' maple house '):
             with self.subTest(name=name):
                 result = self.c.post('/api/rooms', json={
-                    **body, 'name': name, 'passcode': 'coffee shop',
+                    **body, 'name': name,
                 })
                 self.assertEqual(result.status_code, 200 if name.strip() == 'maple1' else 409)
                 if result.status_code == 409:
@@ -384,7 +355,7 @@ class LaundryTests(unittest.TestCase):
     def test_simultaneous_duplicate_room_creation(self):
         def create(name):
             return self.c.post('/api/rooms', json={
-                'name': name, 'washers': 1, 'dryers': 1, 'passcode': 'a secure code',
+                'name': name, 'washers': 1, 'dryers': 1,
             }).status_code
 
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -392,7 +363,7 @@ class LaundryTests(unittest.TestCase):
         self.assertEqual(sorted(statuses), [200, 409, 409])
 
     def test_room_setup_field_boundaries(self):
-        base = {'name': 'Boundary room', 'washers': 1, 'dryers': 1, 'passcode': 'room code'}
+        base = {'name': 'Boundary room', 'washers': 1, 'dryers': 1}
         for key, values in (
             ('name', ('', '   ', 'a' * 61, 'room\x00name')),
             ('washers', (-1, 51, 1.5, True, '1')),
@@ -409,7 +380,7 @@ class LaundryTests(unittest.TestCase):
                 self.assertEqual(room.status_code, 200)
                 state = self.c.get('/api/state', headers={
                     'X-Client-Id': 'alice', 'X-Room-Code': room.json()['code'],
-                    'X-Room-Passcode': base['passcode'],
+                    'X-Room-Token': room.json()['token'],
                 }).json()
                 self.assertEqual(sum(m['type'] == 'washer' for m in state['machines']), washers)
                 self.assertEqual(sum(m['type'] == 'dryer' for m in state['machines']), dryers)

@@ -200,7 +200,7 @@ function updateRoom(room) {
 
 const roomControls = document.createElement('div');
 roomControls.className = 'room-controls';
-roomControls.innerHTML = '<button id="edit-room">Edit room</button><button id="change-passcode">Change room passcode</button><button id="invite-room">Invite residents</button>';
+roomControls.innerHTML = '<button id="edit-room">Edit room</button><button id="invite-room">Invite residents</button>';
 $('.section-head').append(roomControls);
 const roomPicker = $('.room-picker');
 const roomOptions = $('#room-picker-options');
@@ -268,7 +268,6 @@ $('#leave-room').onclick = async () => {
     localStorage.removeItem('loop-token-' + code);
     localStorage.removeItem('loop-room-name-' + code);
     if (localStorage.getItem('loop-room') === code) localStorage.removeItem('loop-room');
-    sessionStorage.removeItem('loop-pass-' + code);
 
     const next = savedRooms()[0];
     if (next) {
@@ -290,17 +289,15 @@ $('#leave-room').onclick = async () => {
 };
 
 function formDialog(title, fields, errorMessage = ''){return new Promise(resolve=>{const d=document.createElement('dialog');const form=document.createElement('form');const heading=document.createElement('h2');heading.textContent=title;form.append(heading);if(errorMessage){const error=document.createElement('p');error.setAttribute('role','alert');error.textContent=errorMessage;form.append(error)}for(const field of fields){const label=document.createElement('label');label.textContent=field.label;const input=document.createElement('input');input.name=field.name;input.type=field.type||'text';input.value=field.value??'';input.required=true;if(input.type==='number'){input.min='0';input.max='50';input.step='1'}label.append(input);form.append(label)}const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel';const submit=document.createElement('button');submit.textContent='Continue';submit.type='submit';form.append(cancel,submit);d.append(form);document.body.append(d);let finished=false;function finish(data){if(finished)return;finished=true;d.close();d.remove();resolve(data)}cancel.onclick=()=>finish(null);d.addEventListener('cancel',e=>{e.preventDefault();finish(null)});form.addEventListener('submit',e=>{e.preventDefault();finish(Object.fromEntries(new FormData(form)))});d.showModal()})}
-async function rememberRoom(code, passcode) {
+async function rememberRoom(code) {
   const res = await nativeFetch('/api/room/membership', {
     method: 'POST',
-    headers: {'X-Room-Code': code, 'X-Client-Id': client, 'Content-Type': 'application/json'},
-    body: JSON.stringify({passcode}),
+    headers: {'X-Room-Code': code, 'X-Client-Id': client},
   });
-  if (res.status === 403 || res.status === 422) throw Error('Incorrect room code or passcode.');
-  if (!res.ok) throw Error('Unable to save room access. Please try again.');
+  if (res.status === 404 || res.status === 422) throw Error((await res.json()).detail);
+  if (!res.ok) throw Error('Unable to join the room. Please try again.');
   const {token} = await res.json();
   localStorage.setItem('loop-token-' + code, token);
-  sessionStorage.removeItem('loop-pass-' + code);
   return token;
 }
 
@@ -329,9 +326,6 @@ function roomFormError(detail) {
   const issue = detail?.[0];
   if (issue?.msg?.startsWith('Value error, ')) return issue.msg.slice('Value error, '.length);
   if (issue?.loc?.includes('name')) return 'Use a room name with 1–60 characters.';
-  if (issue?.loc?.includes('passcode')) {
-    return 'Use a passcode with 6–128 characters and at least one non-space character.';
-  }
   return 'Check the room name and machine counts and try again.';
 }
 
@@ -342,7 +336,6 @@ async function setupRoom(create) {
     {name: 'washers', label: 'Number of washers', type: 'number', value: create ? 3 : machines.filter(m => m.type === 'washer').length},
     {name: 'dryers', label: 'Number of dryers', type: 'number', value: create ? 3 : machines.filter(m => m.type === 'dryer').length},
   ];
-  if (create) fields.push({name: 'passcode', label: 'Room passcode (6–128 characters)', type: 'password'});
   let message = '';
   try {
     while (true) {
@@ -374,15 +367,7 @@ $('#edit-room').onclick = () => setupRoom(false);
 let accessOpen=false;
 async function openRememberedRoom(code) {
   if (!code) return false;
-  let token = localStorage.getItem('loop-token-' + code);
-  const legacyPasscode = sessionStorage.getItem('loop-pass-' + code);
-  if (!token && legacyPasscode) {
-    try {
-      token = await rememberRoom(code, legacyPasscode);
-    } catch {
-      sessionStorage.removeItem('loop-pass-' + code);
-    }
-  }
+  const token = localStorage.getItem('loop-token-' + code);
   if (!token) return false;
   return changeRoom(code, token);
 }
@@ -400,53 +385,21 @@ async function showAccess(knownCode = '') {
     }
     if (await openRememberedRoom(code)) return;
     if (localStorage.getItem('loop-token-' + code) && !roomAccessRejected) return;
-    const login = await formDialog(`Join room ${code}`, [{name: 'passcode', label: 'Room passcode', type: 'password'}]);
-    if (login) await changeRoom(code, await rememberRoom(code, login.passcode));
+    if (!/^[A-Z0-9]{1,32}$/.test(code)) throw Error('Enter a valid room code.');
+    await changeRoom(code, await rememberRoom(code));
   } catch (error) {
     toast(error.message);
   } finally {
     accessOpen = false;
   }
 }
-$('#change-passcode').onclick = async () => {
-  const version = roomVersion;
-  const fields = [
-    {name: 'current_passcode', label: 'Current passcode', type: 'password'},
-    {name: 'passcode', label: 'New passcode (6–128 characters)', type: 'password'},
-    {name: 'confirm_passcode', label: 'Confirm new passcode', type: 'password'},
-  ];
-  let message = '';
-  try {
-    while (version === roomVersion) {
-      const result = await formDialog('Change room passcode', fields, message);
-      if (!result || version !== roomVersion) return;
-      if (result.passcode !== result.confirm_passcode) {
-        message = 'The new passcodes do not match.';
-        continue;
-      }
-      const res = await roomRequest('/api/room/passcode', {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({current_passcode: result.current_passcode, passcode: result.passcode}),
-      });
-      if (res.ok) {
-        toast('Room passcode updated.');
-        return;
-      }
-      message = roomFormError((await res.json()).detail);
-      if (res.status !== 403 && res.status !== 422) throw Error(message);
-    }
-  } catch (error) {
-    toast(error.message);
-  }
-};
-$('#invite-room').onclick=()=>{const d=document.createElement('dialog');const url=new URL(location.href);url.search='?room='+encodeURIComponent(roomCode);url.hash='';d.innerHTML='<form method="dialog"><h2>Invite residents</h2><p>Share this code or link and give your housemates the passcode separately.</p><label>Room code<input readonly></label><label>Invite link<input readonly></label><button>Done</button></form>';const inputs=d.querySelectorAll('input');inputs[0].value=roomCode;inputs[1].value=url.href;document.body.append(d);d.addEventListener('close',()=>d.remove());d.showModal()};
+$('#invite-room').onclick=()=>{const d=document.createElement('dialog');const url=new URL(location.href);url.search='?room='+encodeURIComponent(roomCode);url.hash='';d.innerHTML='<form method="dialog"><h2>Invite residents</h2><p>Anyone with this code or link can join. Share it with your housemates.</p><label>Room code<input readonly></label><label>Invite link<input readonly></label><button>Done</button></form>';const inputs=d.querySelectorAll('input');inputs[0].value=roomCode;inputs[1].value=url.href;document.body.append(d);d.addEventListener('close',()=>d.remove());d.showModal()};
 
 const entry=document.createElement('section');entry.id='entry-screen';entry.className='entry-screen';entry.innerHTML=`<div class="entry-card"><div class="entry-brand">◉ loop<span>.</span></div><div class="eyebrow">LAUNDRY, IN THE LOOP</div><h1>A little more flow<br><em>to your day.</em></h1><p>Keep track of shared laundry, without creating a profile.</p><div class="entry-actions"><button id="entry-create"><strong>Create a room</strong><span>Set up a space for your building or house</span><b>↗</b></button><button id="entry-join"><strong>Join a room</strong><span>Find a room by its code</span><b>↗</b></button><button id="entry-return"><strong>Return to my room</strong><span>Open a room you joined on this browser</span><b>↗</b></button></div><p class="entry-message" role="status"></p></div>`;document.body.prepend(entry);
 function returnRoomCodes() {
   const last = localStorage.getItem('loop-room');
   const codes = savedRooms().map(room => room.code);
-  if (last && (codes.includes(last) || sessionStorage.getItem('loop-pass-' + last))) {
+  if (last && codes.includes(last)) {
     return [last, ...codes.filter(code => code !== last)];
   }
   return codes;
@@ -558,7 +511,7 @@ async function openInstall() {
     + '<label hidden>Room code<input readonly></label><button>Done</button></form>';
   const steps = isAppleMobile
     ? ['Open this page in Safari. Tap Share, then Add to Home Screen. Confirm by tapping Add.',
-       'Open Loop from its new icon. If your room isn’t shown, choose Join a room and use your room code and passcode.',
+       'Open Loop from its new icon. If your room isn’t shown, choose Join a room and enter your room code.',
        'Tap Allow device notifications and confirm the phone prompt.']
     : ['Open the browser menu and choose Install app or Add to Home screen.',
        'Open Loop and tap Allow device notifications.'];
